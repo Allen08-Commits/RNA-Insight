@@ -1,0 +1,3 @@
+sequence_id,chrom,start,end,strand
+EXAMPLE_STRESS_RNA_01,chr1,1000,1021,+
+EXAMPLE_STRESS_RNA_02,chr2,2000,2020,-
