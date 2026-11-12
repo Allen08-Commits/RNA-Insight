@@ -1,1 +1,1 @@
-"""Core components of RNA-Insight."""
+"""Core analysis modules for RNA-Insight."""
