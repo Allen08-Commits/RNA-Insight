@@ -5,3 +5,5 @@ plotly>=5.20,<7
 openpyxl>=3.1,<4
 scipy>=1.12,<2
 biopython>=1.83,<2
+tabulate>=0.9,<1
+pytest>=8,<9
