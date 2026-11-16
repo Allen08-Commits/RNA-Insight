@@ -99,6 +99,109 @@ def normalize_chromosome(value):
     return value
 
 
+def build_unique_rg4_regions(results):
+    """
+    Merge overlapping rG4 candidate intervals from both screening methods.
+
+    Intervals are merged only when they belong to the same transcript and
+    overlap in 0-based, half-open coordinates. Adjacent intervals are kept
+    separate. The original candidate table is not modified.
+    """
+
+    columns = [
+        "sequence_id",
+        "start",
+        "end",
+        "candidate_methods",
+        "source_candidate_records",
+    ]
+
+    if results is None or results.empty:
+        return pd.DataFrame(columns=columns)
+
+    required = {"sequence_id", "start", "end", "candidate_type"}
+    missing = required - set(results.columns)
+    if missing:
+        raise ValueError(
+            "Cannot calculate unique rG4 regions. Missing columns: "
+            + ", ".join(sorted(missing))
+        )
+
+    candidates = results.copy()
+    candidates["sequence_id"] = (
+        candidates["sequence_id"].apply(normalize_transcript_id)
+    )
+    candidates["start"] = pd.to_numeric(
+        candidates["start"], errors="coerce"
+    )
+    candidates["end"] = pd.to_numeric(
+        candidates["end"], errors="coerce"
+    )
+    candidates = candidates.dropna(
+        subset=["sequence_id", "start", "end"]
+    )
+    candidates = candidates[
+        (candidates["sequence_id"] != "")
+        & (candidates["end"] > candidates["start"])
+    ].copy()
+
+    unique_rows = []
+
+    for transcript_id, group in candidates.groupby(
+        "sequence_id", sort=True
+    ):
+        group = group.sort_values(["start", "end"])
+        current_start = None
+        current_end = None
+        current_methods = set()
+        current_record_count = 0
+
+        for row in group.itertuples(index=False):
+            start = int(row.start)
+            end = int(row.end)
+            method = str(row.candidate_type)
+
+            if current_start is None:
+                current_start = start
+                current_end = end
+                current_methods = {method}
+                current_record_count = 1
+                continue
+
+            # Half-open intervals overlap when next start < current end.
+            if start < current_end:
+                current_end = max(current_end, end)
+                current_methods.add(method)
+                current_record_count += 1
+            else:
+                unique_rows.append({
+                    "sequence_id": transcript_id,
+                    "start": current_start,
+                    "end": current_end,
+                    "candidate_methods": ", ".join(
+                        sorted(current_methods)
+                    ),
+                    "source_candidate_records": current_record_count,
+                })
+                current_start = start
+                current_end = end
+                current_methods = {method}
+                current_record_count = 1
+
+        if current_start is not None:
+            unique_rows.append({
+                "sequence_id": transcript_id,
+                "start": current_start,
+                "end": current_end,
+                "candidate_methods": ", ".join(
+                    sorted(current_methods)
+                ),
+                "source_candidate_records": current_record_count,
+            })
+
+    return pd.DataFrame(unique_rows, columns=columns)
+
+
 def check_hg38_assembly(mapping):
     """Check that Ensembl mapping uses the expected hg38 assembly."""
 
@@ -891,7 +994,7 @@ elif page == "rG4 sequence analysis":
 
                 st.success(
                     f"Screening completed. {len(results)} "
-                    "candidate intervals identified."
+                    "candidate records identified."
                 )
 
             except Exception as exc:
@@ -915,12 +1018,40 @@ elif page == "rG4 sequence analysis":
                     results["candidate_type"] == "canonical_motif"
                 ]
 
-                c1, c2, c3 = st.columns(3)
+                unique_regions = build_unique_rg4_regions(results)
 
-                c1.metric("Total candidate intervals", len(results))
-                c2.metric("G4Hunter regions", len(g4hunter))
-                c3.metric("Canonical motifs", len(canonical))
+                c1, c2, c3, c4 = st.columns(4)
 
+                c1.metric(
+                    "Total unique rG4 regions",
+                    len(unique_regions)
+                )
+                c2.metric("Total candidate records", len(results))
+                c3.metric("G4Hunter records", len(g4hunter))
+                c4.metric("Canonical motif records", len(canonical))
+
+                st.caption(
+                    "Unique regions are calculated by merging overlapping "
+                    "candidate intervals on the same transcript across both "
+                    "screening methods. Adjacent but non-overlapping intervals "
+                    "remain separate."
+                )
+
+                st.subheader("Unique rG4 regions")
+                st.dataframe(
+                    unique_regions,
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+                st.download_button(
+                    "Download unique rG4 regions CSV",
+                    unique_regions.to_csv(index=False).encode("utf-8"),
+                    file_name="RNA_Insight_unique_rg4_regions.csv",
+                    mime="text/csv"
+                )
+
+                st.subheader("All screening candidate records")
                 st.dataframe(
                     results,
                     use_container_width=True,
@@ -1431,19 +1562,26 @@ elif page == "Results & report":
     # SUMMARY METRICS
     # -----------------------------
 
-    c1, c2, c3 = st.columns(3)
+    unique_rg4 = build_unique_rg4_regions(rg4)
+
+    c1, c2, c3, c4 = st.columns(4)
 
     c1.metric(
-        "rG4 candidate intervals",
-        len(rg4),
+        "Unique rG4 regions",
+        len(unique_rg4),
     )
 
     c2.metric(
+        "All rG4 candidate records",
+        len(rg4),
+    )
+
+    c3.metric(
         "APA annotation sites",
         len(apa),
     )
 
-    c3.metric(
+    c4.metric(
         "Integrated candidates",
         len(integrated) if integrated is not None else 0,
     )
