@@ -1,38 +1,29 @@
 
-"""RNA-Insight: Human stress-response gene and rG4–APA research."""
+"""
+RNA-Insight
+In-Silico Analysis of RNA G-Quadruplex-Mediated
+Alternative Polyadenylation in Human Stress-Response Genes
+"""
 
 from __future__ import annotations
 
+import re
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from core.io import (
-    read_fasta,
-    read_tabular,
-    read_bed,
-    read_gtf,
-    detect_input,
-    validate_rna_records,
-)
+from core.io import read_fasta, validate_rna_records
 from core.rg4 import scan_rg4
-from core.apa import (
-    fetch_apa_sites,
-    standardize_apa_sites,
-    summarize_apa_sites,
-)
-from core.integration import integrate_rg4_apa
+from core.apa import fetch_apa_sites, summarize_apa_sites
+from core.gene_data import DEFAULT_GENES, fetch_gene_panel
+from core.mapping import build_transcript_exon_mapping
 from core.report import build_report
-from core.gene_data import (
-    DEFAULT_GENES,
-    fetch_gene_panel,
-)
 
 
-# --------------------------------------------------
+# ==================================================
 # PAGE CONFIGURATION
-# --------------------------------------------------
+# ==================================================
 
 st.set_page_config(
     page_title="RNA-Insight",
@@ -42,9 +33,9 @@ st.set_page_config(
 )
 
 
-# --------------------------------------------------
+# ==================================================
 # CUSTOM UI
-# --------------------------------------------------
+# ==================================================
 
 st.markdown("""
 <style>
@@ -82,98 +73,456 @@ div.stButton > button:hover {
 """, unsafe_allow_html=True)
 
 
-# --------------------------------------------------
-# GENOMIC VISUALIZATION
-# --------------------------------------------------
+# ==================================================
+# HELPER FUNCTIONS
+# ==================================================
 
-def create_genomic_figure(
-    integrated: pd.DataFrame,
-    apa_sites: pd.DataFrame,
-    chromosome: str,
-) -> go.Figure:
-    """Plot mapped rG4 candidate intervals and APA annotations."""
+def normalize_transcript_id(value):
+    """Extract the Ensembl transcript ID from a FASTA header."""
+
+    value = str(value).strip()
+
+    if not value:
+        return ""
+
+    return value.split("|")[0].split()[0]
+
+
+def normalize_chromosome(value):
+    """Normalize chromosome labels for comparison."""
+
+    value = str(value).strip().lower()
+
+    if value.startswith("chr"):
+        value = value[3:]
+
+    return value
+
+
+def check_hg38_assembly(mapping):
+    """Check that Ensembl mapping uses the expected hg38 assembly."""
+
+    if "assembly_name" not in mapping.columns:
+        raise ValueError(
+            "The Ensembl mapping does not contain assembly information."
+        )
+
+    assemblies = (
+        mapping["assembly_name"]
+        .dropna()
+        .astype(str)
+        .unique()
+        .tolist()
+    )
+
+    if not assemblies:
+        raise ValueError("Genome assembly information is unavailable.")
+
+    incompatible = [
+        assembly for assembly in assemblies
+        if "GRCh38" not in assembly.upper()
+    ]
+
+    if incompatible:
+        raise ValueError(
+            "The mapping assembly may not be compatible with "
+            f"PolyA_DB hg38. Retrieved assembly: {assemblies}"
+        )
+
+
+def integrate_gene_level_apa(rg4, apa, mapping):
+    """
+    Map transcript-level rG4 candidates to genomic exon segments
+    and compare them with gene-level PolyA_DB annotations.
+
+    This is a gene-level genomic overlap analysis, not a
+    transcript-specific APA assignment or causal analysis.
+    """
+
+    required_rg4 = {
+        "sequence_id", "start", "end", "candidate_type"
+    }
+
+    required_apa = {
+        "sequence_id", "chrom", "start", "end",
+        "strand", "site_type"
+    }
+
+    required_mapping = {
+        "sequence_id", "gene_symbol", "chrom", "start", "end",
+        "strand", "transcript_start", "transcript_end",
+        "assembly_name"
+    }
+
+    for frame, required, label in [
+        (rg4, required_rg4, "rG4"),
+        (apa, required_apa, "APA"),
+        (mapping, required_mapping, "Mapping")
+    ]:
+        missing = required - set(frame.columns)
+
+        if missing:
+            raise ValueError(
+                f"{label} data is missing columns: "
+                + ", ".join(sorted(missing))
+            )
+
+    candidates = rg4.copy()
+    sites = apa.copy()
+    exons = mapping.copy()
+
+    candidates["sequence_id"] = (
+        candidates["sequence_id"].apply(normalize_transcript_id)
+    )
+
+    exons["sequence_id"] = (
+        exons["sequence_id"].astype(str).str.strip()
+    )
+
+    exons["gene_symbol"] = (
+        exons["gene_symbol"].astype(str).str.upper().str.strip()
+    )
+
+    sites["sequence_id"] = (
+        sites["sequence_id"].astype(str).str.upper().str.strip()
+    )
+
+    for frame, columns, label in [
+        (candidates, ["start", "end"], "rG4"),
+        (sites, ["start", "end"], "APA"),
+        (exons, ["start", "end", "transcript_start", "transcript_end"],
+         "Mapping")
+    ]:
+        for column in columns:
+            frame[column] = pd.to_numeric(
+                frame[column], errors="coerce"
+            )
+
+        if frame[columns].isna().any().any():
+            raise ValueError(
+                f"{label} data contains invalid coordinates."
+            )
+
+    if (candidates["end"] <= candidates["start"]).any():
+        raise ValueError("Invalid rG4 candidate intervals.")
+
+    if (sites["end"] <= sites["start"]).any():
+        raise ValueError("Invalid APA intervals.")
+
+    if (exons["end"] <= exons["start"]).any():
+        raise ValueError("Invalid genomic exon intervals.")
+
+    if (
+        exons["transcript_end"] <= exons["transcript_start"]
+    ).any():
+        raise ValueError("Invalid transcript exon intervals.")
+
+    results = []
+
+    mapping_groups = {
+        key: group.sort_values("transcript_start")
+        for key, group in exons.groupby("sequence_id")
+    }
+
+    for candidate in candidates.itertuples(index=False):
+
+        transcript_id = normalize_transcript_id(
+            candidate.sequence_id
+        )
+
+        if transcript_id not in mapping_groups:
+            continue
+
+        exon_rows = mapping_groups[transcript_id]
+
+        gene_symbol = str(
+            exon_rows["gene_symbol"].iloc[0]
+        ).upper()
+
+        strand = str(exon_rows["strand"].iloc[0])
+        chromosome = str(exon_rows["chrom"].iloc[0])
+
+        local_start = int(candidate.start)
+        local_end = int(candidate.end)
+
+        transcript_length = int(
+            exon_rows["transcript_end"].max()
+        )
+
+        if local_start < 0 or local_end > transcript_length:
+            continue
+
+        segments = []
+        covered_bases = 0
+
+        # Map transcript coordinates through individual exons.
+        for exon in exon_rows.itertuples(index=False):
+
+            overlap_start = max(
+                local_start, int(exon.transcript_start)
+            )
+
+            overlap_end = min(
+                local_end, int(exon.transcript_end)
+            )
+
+            if overlap_start >= overlap_end:
+                continue
+
+            covered_bases += overlap_end - overlap_start
+
+            if strand == "+":
+
+                genomic_start = (
+                    int(exon.start)
+                    + overlap_start
+                    - int(exon.transcript_start)
+                )
+
+                genomic_end = (
+                    int(exon.start)
+                    + overlap_end
+                    - int(exon.transcript_start)
+                )
+
+            elif strand == "-":
+
+                genomic_start = (
+                    int(exon.end)
+                    - (
+                        overlap_end
+                        - int(exon.transcript_start)
+                    )
+                )
+
+                genomic_end = (
+                    int(exon.end)
+                    - (
+                        overlap_start
+                        - int(exon.transcript_start)
+                    )
+                )
+
+            else:
+                raise ValueError(
+                    f"Invalid strand for {transcript_id}."
+                )
+
+            segments.append({
+                "chrom": str(exon.chrom),
+                "start": genomic_start,
+                "end": genomic_end,
+                "strand": strand
+            })
+
+        # Reject incomplete mappings.
+        if covered_bases != local_end - local_start:
+            continue
+
+        # Select gene-level PAS annotations matching gene,
+        # chromosome and strand.
+        gene_sites = sites[
+            sites["sequence_id"].eq(gene_symbol)
+            & sites["strand"].astype(str).eq(strand)
+            & sites["chrom"].apply(normalize_chromosome).eq(
+                normalize_chromosome(chromosome)
+            )
+        ].copy()
+
+        matched_records = []
+
+        for segment in segments:
+
+            overlapping = gene_sites[
+                (gene_sites["start"] < segment["end"])
+                & (gene_sites["end"] > segment["start"])
+            ]
+
+            if not overlapping.empty:
+                matched_records.extend(
+                    overlapping.to_dict("records")
+                )
+
+        if matched_records:
+            matched = (
+                pd.DataFrame(matched_records)
+                .drop_duplicates()
+                .reset_index(drop=True)
+            )
+        else:
+            matched = pd.DataFrame(columns=sites.columns)
+
+        segment_labels = [
+            (
+                f"{segment['chrom']}:"
+                f"{segment['start']}-{segment['end']}"
+                f"({segment['strand']})"
+            )
+            for segment in segments
+        ]
+
+        if not matched.empty:
+
+            apa_labels = [
+                (
+                    f"{row.chrom}:{row.start}-{row.end} "
+                    f"({row.site_type})"
+                )
+                for row in matched.itertuples()
+            ]
+
+            apa_types = sorted(
+                matched["site_type"]
+                .fillna("unspecified")
+                .astype(str)
+                .unique()
+                .tolist()
+            )
+
+        else:
+            apa_labels = []
+            apa_types = []
+
+        results.append({
+            "sequence_id": transcript_id,
+            "gene_symbol": gene_symbol,
+            "candidate_start": local_start,
+            "candidate_end": local_end,
+            "chrom": chromosome,
+            "strand": strand,
+            "candidate_type": candidate.candidate_type,
+            "score": getattr(candidate, "score", None),
+            "genomic_segments": "; ".join(segment_labels),
+            "overlaps_gene_level_apa": not matched.empty,
+            "overlapping_apa_sites": len(matched),
+            "overlapping_apa_types": ", ".join(apa_types),
+            "overlapping_apa_coordinates": "; ".join(apa_labels),
+            "interpretation": "Gene-level genomic overlap"
+        })
+
+    output_columns = [
+        "sequence_id",
+        "gene_symbol",
+        "candidate_start",
+        "candidate_end",
+        "chrom",
+        "strand",
+        "candidate_type",
+        "score",
+        "genomic_segments",
+        "overlaps_gene_level_apa",
+        "overlapping_apa_sites",
+        "overlapping_apa_types",
+        "overlapping_apa_coordinates",
+        "interpretation"
+    ]
+
+    return pd.DataFrame(results, columns=output_columns)
+
+
+def create_genomic_figure(integrated, apa_sites, chromosome):
+    """Visualize mapped rG4 genomic segments and APA annotations."""
 
     fig = go.Figure()
 
-    candidates = integrated[
+    selected = integrated[
         integrated["chrom"].astype(str) == str(chromosome)
     ].copy()
 
-    apa = apa_sites[
-        apa_sites["chrom"].astype(str) == str(chromosome)
-    ].copy()
+    y_positions = {
+        "rG4 candidates": 1,
+        "APA annotations": 0
+    }
 
-    for candidate_type in sorted(
-        candidates["candidate_type"].astype(str).unique()
-    ):
-        subset = candidates[
-            candidates["candidate_type"].astype(str)
-            == candidate_type
-        ]
+    for row in selected.itertuples():
 
-        for row in subset.itertuples():
+        segments = str(row.genomic_segments).split(";")
+
+        for segment in segments:
+
+            match = re.search(
+                r":(\d+)-(\d+)\(",
+                segment.strip()
+            )
+
+            if not match:
+                continue
+
+            start = int(match.group(1))
+            end = int(match.group(2))
+
             fig.add_trace(
                 go.Scatter(
-                    x=[row.genomic_start, row.genomic_end],
-                    y=["rG4 candidates", "rG4 candidates"],
+                    x=[start, end],
+                    y=[y_positions["rG4 candidates"]] * 2,
                     mode="lines",
-                    name=f"rG4: {candidate_type}",
                     line=dict(width=10),
+                    name=f"rG4: {row.candidate_type}",
                     text=[
                         f"{row.sequence_id}<br>"
-                        f"{candidate_type}<br>"
-                        f"{row.chrom}:{row.genomic_start}-{row.genomic_end}"
-                        for _ in range(2)
+                        f"{row.gene_symbol}<br>"
+                        f"{row.candidate_type}<br>"
+                        f"{chromosome}:{start}-{end}",
+                        f"{row.sequence_id}<br>"
+                        f"{row.gene_symbol}<br>"
+                        f"{row.candidate_type}<br>"
+                        f"{chromosome}:{start}-{end}"
                     ],
                     hovertemplate="%{text}<extra></extra>",
-                    showlegend=False,
+                    showlegend=False
                 )
             )
 
+    apa = apa_sites[
+        apa_sites["chrom"].apply(normalize_chromosome).eq(
+            normalize_chromosome(chromosome)
+        )
+    ].copy()
+
     if not apa.empty:
+
         apa["midpoint"] = (
             apa["start"] + apa["end"]
         ) / 2
 
-        for site_type in sorted(
-            apa["site_type"].astype(str).unique()
-        ):
-            subset = apa[
-                apa["site_type"].astype(str) == site_type
-            ]
-
-            fig.add_trace(
-                go.Scatter(
-                    x=subset["midpoint"],
-                    y=["APA annotations"] * len(subset),
-                    mode="markers",
-                    name=f"APA: {site_type}",
-                    marker=dict(size=13, symbol="diamond"),
-                    text=[
+        fig.add_trace(
+            go.Scatter(
+                x=apa["midpoint"],
+                y=[y_positions["APA annotations"]] * len(apa),
+                mode="markers",
+                marker=dict(size=10, symbol="diamond"),
+                name="APA annotations",
+                text=[
+                    (
                         f"{row.sequence_id}<br>"
                         f"{row.site_type}<br>"
                         f"{row.chrom}:{row.start}-{row.end}"
-                        for row in subset.itertuples()
-                    ],
-                    hovertemplate="%{text}<extra></extra>",
-                )
+                    )
+                    for row in apa.itertuples()
+                ],
+                hovertemplate="%{text}<extra></extra>"
             )
+        )
 
     fig.update_layout(
-        title=f"rG4 candidates and APA annotations on {chromosome}",
+        title=f"rG4 candidates and APA annotations: {chromosome}",
         xaxis_title="Genomic coordinate (bp)",
-        yaxis_title="Feature",
+        yaxis=dict(
+            tickmode="array",
+            tickvals=[0, 1],
+            ticktext=["APA annotations", "rG4 candidates"]
+        ),
         template="plotly_dark",
         height=430,
-        hovermode="closest",
+        hovermode="closest"
     )
 
     return fig
 
 
-# --------------------------------------------------
+# ==================================================
 # SESSION STATE
-# --------------------------------------------------
+# ==================================================
 
 defaults = {
     "fasta_data": None,
@@ -181,16 +530,19 @@ defaults = {
     "apa_results": None,
     "integrated_results": None,
     "gene_panel": None,
+    "exon_mapping": None,
+    "mapping_status": None
 }
 
 for key, value in defaults.items():
+
     if key not in st.session_state:
         st.session_state[key] = value
 
 
-# --------------------------------------------------
-# HEADER
-# --------------------------------------------------
+# ==================================================
+# APPLICATION HEADER
+# ==================================================
 
 st.markdown("# 🧬 RNA-Insight")
 
@@ -207,11 +559,12 @@ st.caption(
 st.divider()
 
 
-# --------------------------------------------------
-# SIDEBAR
-# --------------------------------------------------
+# ==================================================
+# SIDEBAR NAVIGATION
+# ==================================================
 
 with st.sidebar:
+
     st.title("Research workspace")
 
     page = st.radio(
@@ -222,17 +575,18 @@ with st.sidebar:
             "rG4 sequence analysis",
             "APA site analysis",
             "Integrated rG4–APA analysis",
-            "Results & report",
-        ],
+            "Results & report"
+        ]
     )
 
     st.divider()
+
     st.caption("RNA-Insight | Computational research tool")
 
 
-# --------------------------------------------------
-# 00 HUMAN GENE DATA RETRIEVAL
-# --------------------------------------------------
+# ==================================================
+# 00 | HUMAN GENE DATA RETRIEVAL
+# ==================================================
 
 if page == "Human gene data retrieval":
 
@@ -250,19 +604,17 @@ if page == "Human gene data retrieval":
 
     st.subheader("Research gene panel")
 
-    default_text = ", ".join(DEFAULT_GENES)
-
     gene_input = st.text_area(
         "Enter human gene symbols separated by commas",
-        value=default_text,
-        help="Example: HSPA1A, HSP90AA1, DDIT3, ATF4",
+        value=", ".join(DEFAULT_GENES),
+        help="Example: HSPA1A, HSP90AA1, DDIT3, ATF4"
     )
 
     max_transcripts = st.slider(
         "Maximum transcripts retrieved per gene",
         min_value=1,
         max_value=20,
-        value=5,
+        value=5
     )
 
     if st.button("Retrieve human gene data"):
@@ -280,21 +632,29 @@ if page == "Human gene data retrieval":
             st.error("Remove duplicate gene symbols.")
 
         else:
+
             with st.spinner(
                 "Connecting to Ensembl and retrieving transcripts..."
             ):
+
                 try:
+
                     result = fetch_gene_panel(
                         gene_symbols=symbols,
-                        max_transcripts_per_gene=max_transcripts,
+                        max_transcripts_per_gene=max_transcripts
                     )
 
                     st.session_state.gene_panel = result
 
+                    # New gene retrieval requires fresh downstream analysis.
+                    st.session_state.rg4_results = None
+                    st.session_state.apa_results = None
+                    st.session_state.integrated_results = None
+                    st.session_state.exon_mapping = None
+                    st.session_state.mapping_status = None
+
                 except Exception as exc:
-                    st.error(
-                        f"Gene retrieval failed: {exc}"
-                    )
+                    st.error(f"Gene retrieval failed: {exc}")
 
     result = st.session_state.gene_panel
 
@@ -307,64 +667,63 @@ if page == "Human gene data retrieval":
         st.divider()
         st.subheader("Retrieval summary")
 
+        successful_sequences = (
+            int(transcripts["sequence_status"].eq("retrieved").sum())
+            if not transcripts.empty else 0
+        )
+
         c1, c2, c3 = st.columns(3)
 
         c1.metric("Genes retrieved", len(genes))
         c2.metric("Transcript records", len(transcripts))
-
-        successful_sequences = (
-            transcripts["sequence_status"].eq("retrieved").sum()
-            if not transcripts.empty
-            else 0
-        )
-
-        c3.metric(
-            "Sequences retrieved",
-            int(successful_sequences),
-        )
+        c3.metric("Sequences retrieved", successful_sequences)
 
         st.subheader("Human gene annotations")
 
         if not genes.empty:
+
             st.dataframe(
                 genes,
                 use_container_width=True,
-                hide_index=True,
+                hide_index=True
             )
 
             st.download_button(
                 "Download gene annotations CSV",
                 genes.to_csv(index=False).encode("utf-8"),
                 file_name="RNA_Insight_human_gene_annotations.csv",
-                mime="text/csv",
+                mime="text/csv"
             )
+
         else:
             st.warning("No gene annotations were retrieved.")
 
         st.subheader("Transcript annotations")
 
         if not transcripts.empty:
+
             st.dataframe(
                 transcripts,
                 use_container_width=True,
-                hide_index=True,
+                hide_index=True
             )
 
             st.download_button(
                 "Download transcript metadata CSV",
                 transcripts.to_csv(index=False).encode("utf-8"),
                 file_name="RNA_Insight_transcript_metadata.csv",
-                mime="text/csv",
+                mime="text/csv"
             )
 
         st.subheader("Retrieved RNA sequences")
 
         if result["fasta"]:
+
             st.download_button(
                 "Download transcript FASTA",
                 result["fasta"].encode("utf-8"),
                 file_name="RNA_Insight_human_transcripts.fasta",
-                mime="text/plain",
+                mime="text/plain"
             )
 
             st.success(
@@ -372,32 +731,33 @@ if page == "Human gene data retrieval":
             )
 
         if not errors.empty:
+
             st.warning(
-                "Some gene lookups could not be completed."
+                "Some gene or transcript lookups could not be completed."
             )
+
             st.dataframe(
                 errors,
                 use_container_width=True,
-                hide_index=True,
+                hide_index=True
             )
 
         st.caption(
             "Source: Ensembl REST API | Species: Homo sapiens. "
-            "Record retrieval date, Ensembl identifiers and assembly "
-            "when using these data in research."
+            "Record the retrieval date, Ensembl identifiers and "
+            "genome assembly when reporting these data."
         )
 
         st.warning(
             "Transcript sequences are mature cDNA sequences. "
-            "Their transcript coordinates must not be treated as "
-            "one continuous genomic interval. Exon-aware mapping "
-            "is required before genomic APA integration."
+            "Their coordinates must be mapped through individual "
+            "exons before genomic analysis."
         )
 
 
-# --------------------------------------------------
-# 01 DATA INTAKE
-# --------------------------------------------------
+# ==================================================
+# 01 | DATA INTAKE AND QUALITY CONTROL
+# ==================================================
 
 elif page == "Data intake & quality control":
 
@@ -411,17 +771,21 @@ elif page == "Data intake & quality control":
     fasta_file = st.file_uploader(
         "Upload RNA or DNA FASTA",
         type=["fasta", "fa", "fna", "txt"],
-        key="fasta_upload",
+        key="fasta_upload"
     )
 
     if fasta_file is not None:
+
         try:
+
             raw_records = read_fasta(fasta_file)
             checked_records = validate_rna_records(raw_records)
 
             st.session_state.fasta_data = checked_records
             st.session_state.rg4_results = None
             st.session_state.integrated_results = None
+            st.session_state.exon_mapping = None
+            st.session_state.mapping_status = None
 
             st.success(
                 f"Loaded {len(checked_records)} FASTA records."
@@ -430,7 +794,7 @@ elif page == "Data intake & quality control":
             st.dataframe(
                 checked_records,
                 use_container_width=True,
-                hide_index=True,
+                hide_index=True
             )
 
             valid_count = int(
@@ -438,11 +802,12 @@ elif page == "Data intake & quality control":
             )
 
             c1, c2, c3 = st.columns(3)
+
             c1.metric("Total sequences", len(checked_records))
             c2.metric("Valid sequences", valid_count)
             c3.metric(
                 "Invalid sequences",
-                len(checked_records) - valid_count,
+                len(checked_records) - valid_count
             )
 
         except Exception as exc:
@@ -451,15 +816,24 @@ elif page == "Data intake & quality control":
     st.divider()
 
     st.subheader("Example dataset")
+
     st.write(
         "Synthetic demonstration FASTA: "
         "`sample_data/example_stress_response_rna.fasta`"
     )
 
+    if st.session_state.fasta_data is not None:
 
-# --------------------------------------------------
-# 02 rG4 ANALYSIS
-# --------------------------------------------------
+        st.info(
+            "For automatic genomic integration, use the transcript "
+            "FASTA downloaded from Human gene data retrieval. "
+            "This ensures that candidate IDs can be matched to Ensembl."
+        )
+
+
+# ==================================================
+# 02 | rG4 SEQUENCE ANALYSIS
+# ==================================================
 
 elif page == "rG4 sequence analysis":
 
@@ -468,6 +842,7 @@ elif page == "rG4 sequence analysis":
     records = st.session_state.fasta_data
 
     if records is None:
+
         st.info(
             "Upload a FASTA file in Data intake & quality control first."
         )
@@ -477,15 +852,17 @@ elif page == "rG4 sequence analysis":
         c1, c2 = st.columns(2)
 
         with c1:
+
             window_size = st.slider(
                 "G4Hunter sliding window size (nt)",
-                10, 100, 25,
+                10, 100, 25
             )
 
         with c2:
+
             threshold = st.slider(
                 "Minimum G4Hunter score",
-                0.5, 4.0, 1.2, 0.1,
+                0.5, 4.0, 1.2, 0.1
             )
 
         st.caption(
@@ -496,6 +873,7 @@ elif page == "rG4 sequence analysis":
         if st.button("Run rG4 screening"):
 
             try:
+
                 valid_records = records[
                     records["valid_sequence"]
                 ].copy()
@@ -503,11 +881,13 @@ elif page == "rG4 sequence analysis":
                 results = scan_rg4(
                     valid_records,
                     window_size=window_size,
-                    score_threshold=threshold,
+                    score_threshold=threshold
                 )
 
                 st.session_state.rg4_results = results
                 st.session_state.integrated_results = None
+                st.session_state.exon_mapping = None
+                st.session_state.mapping_status = None
 
                 st.success(
                     f"Screening completed. {len(results)} "
@@ -522,6 +902,7 @@ elif page == "rG4 sequence analysis":
         if results is not None:
 
             if results.empty:
+
                 st.warning("No candidate regions detected.")
 
             else:
@@ -535,6 +916,7 @@ elif page == "rG4 sequence analysis":
                 ]
 
                 c1, c2, c3 = st.columns(3)
+
                 c1.metric("Total candidate intervals", len(results))
                 c2.metric("G4Hunter regions", len(g4hunter))
                 c3.metric("Canonical motifs", len(canonical))
@@ -542,57 +924,66 @@ elif page == "rG4 sequence analysis":
                 st.dataframe(
                     results,
                     use_container_width=True,
-                    hide_index=True,
+                    hide_index=True
                 )
 
                 st.subheader("G4Hunter score distribution")
 
                 if not g4hunter.empty:
+
                     fig = px.histogram(
                         g4hunter,
                         x="score",
                         nbins=15,
                         labels={
                             "score": "Mean G4Hunter window score",
-                            "count": "Candidate count",
-                        },
+                            "count": "Candidate count"
+                        }
                     )
+
                     st.plotly_chart(
                         fig,
-                        use_container_width=True,
+                        use_container_width=True
                     )
+
                 else:
+
                     st.info(
-                        "No G4Hunter sliding-window candidates "
-                        "were detected."
+                        "No G4Hunter sliding-window candidates were detected."
                     )
 
                 st.subheader("Canonical motif results")
 
                 if not canonical.empty:
+
+                    display_columns = [
+                        column for column in [
+                            "sequence_id",
+                            "start",
+                            "end",
+                            "candidate_sequence",
+                            "score",
+                            "score_type",
+                            "length"
+                        ]
+                        if column in canonical.columns
+                    ]
+
                     st.dataframe(
-                        canonical[
-                            [
-                                "sequence_id",
-                                "start",
-                                "end",
-                                "candidate_sequence",
-                                "score",
-                                "score_type",
-                                "length",
-                            ]
-                        ],
+                        canonical[display_columns],
                         use_container_width=True,
-                        hide_index=True,
+                        hide_index=True
                     )
+
                 else:
+
                     st.info("No canonical motifs detected.")
 
                 st.download_button(
                     "Download rG4 results CSV",
                     results.to_csv(index=False).encode("utf-8"),
                     file_name="RNA_Insight_rg4_candidates.csv",
-                    mime="text/csv",
+                    mime="text/csv"
                 )
 
         st.info(
@@ -601,17 +992,17 @@ elif page == "rG4 sequence analysis":
         )
 
 
-# --------------------------------------------------
-# 03 AUTOMATIC APA ANALYSIS
-# --------------------------------------------------
+# ==================================================
+# 03 | AUTOMATIC APA ANALYSIS
+# ==================================================
 
 elif page == "APA site analysis":
 
     st.header("03 | Alternative polyadenylation site analysis")
 
     st.write(
-        "Retrieve human polyadenylation sites automatically "
-        "from PolyA_DB v4.1."
+        "Retrieve human polyadenylation site annotations "
+        "automatically from PolyA_DB v4.1."
     )
 
     st.info(
@@ -619,9 +1010,10 @@ elif page == "APA site analysis":
         "Source: PolyA_DB v4.1"
     )
 
-    gene_panel = st.session_state.get("gene_panel")
+    gene_panel = st.session_state.gene_panel
 
     if gene_panel is not None and not gene_panel["genes"].empty:
+
         available_genes = (
             gene_panel["genes"]["gene_symbol"]
             .dropna()
@@ -630,25 +1022,31 @@ elif page == "APA site analysis":
             .unique()
             .tolist()
         )
+
     else:
+
         available_genes = DEFAULT_GENES
 
     selected_genes = st.multiselect(
         "Select genes for APA annotation retrieval",
         options=available_genes,
-        default=available_genes,
+        default=available_genes
     )
 
     if st.button("Fetch APA annotations automatically"):
 
         if not selected_genes:
+
             st.warning("Select at least one gene.")
 
         else:
+
             with st.spinner(
                 "Downloading and processing PolyA_DB annotations..."
             ):
+
                 try:
+
                     apa = fetch_apa_sites(
                         gene_symbols=selected_genes
                     )
@@ -661,6 +1059,7 @@ elif page == "APA site analysis":
                     )
 
                 except Exception as exc:
+
                     st.error(
                         f"Automatic APA retrieval failed: {exc}"
                     )
@@ -676,30 +1075,37 @@ elif page == "APA site analysis":
 
         c1, c2, c3 = st.columns(3)
 
-        c1.metric("Total APA sites", summary["total_sites"])
-        c2.metric("Genes represented", summary["sequence_count"])
+        c1.metric(
+            "Total APA sites",
+            summary["total_sites"]
+        )
+
+        c2.metric(
+            "Genes represented",
+            summary["sequence_count"]
+        )
+
         c3.metric(
             "Other site annotations",
-            summary["other_sites"],
+            summary["other_sites"]
         )
 
         st.dataframe(
             apa,
             use_container_width=True,
-            hide_index=True,
+            hide_index=True
         )
 
         st.download_button(
             "Download APA annotations CSV",
             apa.to_csv(index=False).encode("utf-8"),
             file_name="RNA_Insight_apa_annotations.csv",
-            mime="text/csv",
+            mime="text/csv"
         )
 
         st.caption(
             "The current PolyA_DB retrieval returns gene-level "
-            "genomic annotations. These are not transcript-specific "
-            "assignments."
+            "genomic annotations, not transcript-specific assignments."
         )
 
     st.caption(
@@ -707,9 +1113,9 @@ elif page == "APA site analysis":
     )
 
 
-# --------------------------------------------------
-# 04 INTEGRATED ANALYSIS
-# --------------------------------------------------
+# ==================================================
+# 04 | AUTOMATIC INTEGRATED ANALYSIS
+# ==================================================
 
 elif page == "Integrated rG4–APA analysis":
 
@@ -717,117 +1123,290 @@ elif page == "Integrated rG4–APA analysis":
 
     rg4 = st.session_state.rg4_results
     apa = st.session_state.apa_results
+    gene_panel = st.session_state.gene_panel
 
-    if rg4 is None or apa is None:
+    if rg4 is None or rg4.empty:
+
+        st.info("Run rG4 screening first.")
+
+    elif apa is None or apa.empty:
+
+        st.info("Retrieve APA annotations first.")
+
+    elif gene_panel is None:
+
         st.info(
-            "Run rG4 screening and retrieve APA annotations first."
+            "Retrieve human gene and transcript data first. "
+            "Ensembl transcript metadata is required for mapping."
         )
 
     else:
 
-        st.warning(
-            "The automatic PolyA_DB results are gene-level genomic "
-            "annotations. Transcript-specific integration requires "
-            "validated exon mapping and matching genome assemblies. "
-            "Do not use gene symbols as transcript identifiers."
+        st.markdown("### Automatic transcript-to-genome mapping")
+
+        transcripts = gene_panel["transcripts"].copy()
+
+        candidate_ids = set(
+            rg4["sequence_id"]
+            .apply(normalize_transcript_id)
+            .tolist()
         )
 
-        mapping_file = st.file_uploader(
-            "Upload sequence-to-genome mapping CSV",
-            type=["csv", "tsv"],
-            key="mapping_upload",
+        transcripts["transcript_id"] = (
+            transcripts["transcript_id"].astype(str).str.strip()
         )
 
-        if mapping_file is not None:
+        matched_transcripts = transcripts[
+            transcripts["transcript_id"].isin(candidate_ids)
+            & transcripts["sequence_status"].eq("retrieved")
+        ].copy()
 
-            try:
-                mapping = read_tabular(mapping_file)
+        c1, c2 = st.columns(2)
 
-                st.caption(
-                    "Use 0-based, half-open genomic coordinates "
-                    "and a compatible genome assembly."
-                )
+        c1.metric(
+            "rG4 transcript IDs",
+            len(candidate_ids)
+        )
 
-                if st.button("Run integrated analysis"):
+        c2.metric(
+            "Matching Ensembl transcripts",
+            len(matched_transcripts)
+        )
 
-                    integrated = integrate_rg4_apa(
-                        rg4,
-                        apa,
-                        mapping,
+        unmatched = candidate_ids - set(
+            matched_transcripts["transcript_id"]
+        )
+
+        if unmatched:
+
+            st.warning(
+                f"{len(unmatched)} candidate transcript IDs "
+                "were not found in the retrieved Ensembl transcript panel."
+            )
+
+            with st.expander("View unmatched transcript IDs"):
+
+                st.write(sorted(unmatched))
+
+        if matched_transcripts.empty:
+
+            st.error(
+                "No matching transcript IDs were found. "
+                "Use the FASTA downloaded directly from Human gene "
+                "data retrieval and run rG4 screening on that FASTA."
+            )
+
+        else:
+
+            st.caption(
+                "Ensembl exon coordinates will be retrieved automatically. "
+                "A mapping is accepted only when the summed exon length "
+                "matches the retrieved cDNA length."
+            )
+
+            if st.button("Build exon mapping and integrate APA"):
+
+                try:
+
+                    with st.spinner(
+                        "Retrieving and validating Ensembl exon coordinates..."
+                    ):
+
+                        mapping, mapping_status = (
+                            build_transcript_exon_mapping(
+                                matched_transcripts,
+                                delay_seconds=0.15
+                            )
+                        )
+
+                    st.session_state.exon_mapping = mapping
+                    st.session_state.mapping_status = mapping_status
+
+                    if mapping.empty:
+                        raise ValueError(
+                            "Ensembl did not return any validated exon mappings."
+                        )
+
+                    check_hg38_assembly(mapping)
+
+                    validated_ids = set(
+                        mapping_status.loc[
+                            mapping_status["mapping_status"].eq("validated"),
+                            "transcript_id"
+                        ].astype(str)
                     )
+
+                    validated_mapping = mapping[
+                        mapping["sequence_id"].astype(str).isin(
+                            validated_ids
+                        )
+                        & mapping["mapping_status"].eq("validated")
+                    ].copy()
+
+                    validated_rg4 = rg4[
+                        rg4["sequence_id"]
+                        .apply(normalize_transcript_id)
+                        .isin(validated_ids)
+                    ].copy()
+
+                    if validated_rg4.empty:
+
+                        raise ValueError(
+                            "No rG4 candidates belong to transcripts "
+                            "with validated exon mappings."
+                        )
+
+                    with st.spinner(
+                        "Mapping rG4 candidates and comparing APA annotations..."
+                    ):
+
+                        integrated = integrate_gene_level_apa(
+                            validated_rg4,
+                            apa,
+                            validated_mapping
+                        )
 
                     st.session_state.integrated_results = integrated
 
                     st.success(
-                        f"Integration completed: {len(integrated)} "
-                        "mapped candidate intervals."
+                        "Automatic mapping and gene-level APA comparison completed."
                     )
 
-            except Exception as exc:
-                st.error(f"Integration failed: {exc}")
+                except Exception as exc:
 
-        integrated = st.session_state.integrated_results
+                    st.session_state.integrated_results = None
 
-        if integrated is not None:
+                    st.error(
+                        f"Integrated analysis failed: {exc}"
+                    )
 
-            if integrated.empty:
-                st.warning("No candidate regions were mapped.")
+            mapping_status = st.session_state.mapping_status
 
-            else:
+            if mapping_status is not None:
 
-                overlap_count = int(
-                    integrated["overlaps_apa"].sum()
+                st.divider()
+                st.subheader("Ensembl exon mapping quality control")
+
+                validated_count = int(
+                    mapping_status["mapping_status"]
+                    .eq("validated").sum()
+                )
+
+                failed_count = int(
+                    mapping_status["mapping_status"]
+                    .eq("failed").sum()
                 )
 
                 c1, c2 = st.columns(2)
-                c1.metric("Mapped candidates", len(integrated))
-                c2.metric("APA-overlapping candidates", overlap_count)
+
+                c1.metric(
+                    "Validated transcripts",
+                    validated_count
+                )
+
+                c2.metric(
+                    "Failed mappings",
+                    failed_count
+                )
 
                 st.dataframe(
-                    integrated,
+                    mapping_status,
                     use_container_width=True,
-                    hide_index=True,
+                    hide_index=True
                 )
 
                 st.download_button(
-                    "Download integrated results",
-                    integrated.to_csv(index=False).encode("utf-8"),
-                    file_name="RNA_Insight_integrated_results.csv",
-                    mime="text/csv",
+                    "Download exon mapping status",
+                    mapping_status.to_csv(index=False).encode("utf-8"),
+                    file_name="RNA_Insight_exon_mapping_status.csv",
+                    mime="text/csv"
                 )
+
+            integrated = st.session_state.integrated_results
+
+            if integrated is not None:
 
                 st.divider()
-                st.subheader("Genomic coordinate visualization")
+                st.subheader("Integrated results")
 
-                chromosomes = sorted(
-                    integrated["chrom"].astype(str).unique()
-                )
+                if integrated.empty:
 
-                chromosome = st.selectbox(
-                    "Select chromosome",
-                    chromosomes,
-                )
+                    st.warning(
+                        "No candidate regions could be integrated "
+                        "using validated transcript mappings."
+                    )
 
-                fig = create_genomic_figure(
-                    integrated,
-                    apa,
-                    chromosome,
-                )
+                else:
 
-                st.plotly_chart(
-                    fig,
-                    use_container_width=True,
-                )
+                    overlap_count = int(
+                        integrated["overlaps_gene_level_apa"].sum()
+                    )
 
-                st.caption(
-                    "Genomic overlap indicates positional association, "
-                    "not a causal regulatory relationship."
-                )
+                    c1, c2, c3 = st.columns(3)
+
+                    c1.metric(
+                        "Mapped rG4 candidates",
+                        len(integrated)
+                    )
+
+                    c2.metric(
+                        "Gene-level APA overlaps",
+                        overlap_count
+                    )
+
+                    c3.metric(
+                        "Genes represented",
+                        integrated["gene_symbol"].nunique()
+                    )
+
+                    st.dataframe(
+                        integrated,
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+                    st.download_button(
+                        "Download integrated results CSV",
+                        integrated.to_csv(index=False).encode("utf-8"),
+                        file_name="RNA_Insight_integrated_results.csv",
+                        mime="text/csv"
+                    )
+
+                    st.divider()
+                    st.subheader("Genomic coordinate visualization")
+
+                    chromosomes = sorted(
+                        integrated["chrom"].astype(str).unique()
+                    )
+
+                    chromosome = st.selectbox(
+                        "Select chromosome",
+                        chromosomes
+                    )
+
+                    fig = create_genomic_figure(
+                        integrated,
+                        apa,
+                        chromosome
+                    )
+
+                    st.plotly_chart(
+                        fig,
+                        use_container_width=True
+                    )
+
+                    st.warning(
+                        "Interpretation: these results show gene-level "
+                        "genomic overlap between predicted rG4 regions "
+                        "and annotated PAS intervals. They do not establish "
+                        "transcript-specific APA usage, differential APA "
+                        "activity or a causal rG4-mediated mechanism."
+                    )
 
 
-# --------------------------------------------------
-# 05 REPORT
-# --------------------------------------------------
+# ==================================================
+# 05 | RESULTS AND RESEARCH REPORT
+# ==================================================
 
 elif page == "Results & report":
 
@@ -843,23 +1422,36 @@ elif page == "Results & report":
     if apa is None:
         apa = pd.DataFrame()
 
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
 
-    c1.metric("rG4 candidate intervals", len(rg4))
-    c2.metric("APA annotation sites", len(apa))
+    c1.metric(
+        "rG4 candidate intervals",
+        len(rg4)
+    )
+
+    c2.metric(
+        "APA annotation sites",
+        len(apa)
+    )
+
+    c3.metric(
+        "Integrated candidates",
+        len(integrated) if integrated is not None else 0
+    )
 
     report = build_report(
         rg4_candidates=rg4,
         apa_sites=apa,
-        integrated_results=integrated,
+        integrated_results=integrated
     )
 
     st.download_button(
         "Download research report",
         report.encode("utf-8"),
         file_name="RNA_Insight_Research_Report.md",
-        mime="text/markdown",
+        mime="text/markdown"
     )
 
     st.subheader("Report preview")
+
     st.markdown(report)
