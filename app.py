@@ -18,7 +18,7 @@ from core.rg4 import scan_rg4
 from core.apa import fetch_apa_sites, summarize_apa_sites
 from core.gene_data import DEFAULT_GENES, fetch_gene_panel
 from core.mapping import build_transcript_exon_mapping
-from core.report import build_report
+from core.report import build_report, build_pdf_report
 
 
 # ==================================================
@@ -1404,9 +1404,10 @@ elif page == "Integrated rG4–APA analysis":
                     )
 
 
-# ==================================================
-# 05 | RESULTS AND RESEARCH REPORT
-# ==================================================
+
+# --------------------------------------------------
+# 05 REPORT
+# --------------------------------------------------
 
 elif page == "Results & report":
 
@@ -1422,6 +1423,10 @@ elif page == "Results & report":
     if apa is None:
         apa = pd.DataFrame()
 
+    if integrated is None:
+        integrated = pd.DataFrame()
+
+    # Report summary metrics
     c1, c2, c3 = st.columns(3)
 
     c1.metric(
@@ -1436,21 +1441,39 @@ elif page == "Results & report":
 
     c3.metric(
         "Integrated candidates",
-        len(integrated) if integrated is not None else 0
+        len(integrated)
     )
 
+    # Generate report content
     report = build_report(
         rg4_candidates=rg4,
         apa_sites=apa,
-        integrated_results=integrated
+        integrated_results=integrated,
     )
 
-    st.download_button(
-        "Download research report",
-        report.encode("utf-8"),
-        file_name="RNA_Insight_Research_Report.md",
-        mime="text/markdown"
-    )
+    # Generate PDF
+    try:
+        pdf_data = build_pdf_report(report)
+
+        st.download_button(
+            label="📄 Download research report (PDF)",
+            data=pdf_data,
+            file_name="RNA_Insight_Research_Report.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
+
+        st.success(
+            "Your PDF research report is ready to download."
+        )
+
+    except Exception as exc:
+        st.error(
+            f"PDF generation failed: {exc}"
+        )
+
+    # Report preview
+    st.divider()
 
     st.subheader("Report preview")
 
