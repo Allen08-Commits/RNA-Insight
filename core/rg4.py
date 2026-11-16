@@ -1,9 +1,17 @@
 
-"""RNA G-quadruplex prediction using G4Hunter-style scoring."""
+"""RNA G-quadruplex prediction and candidate classification.
+
+Includes:
+1. G4Hunter-style sliding-window screening.
+2. Canonical four-tract G-rich motif screening.
+3. Separate score fields for each prediction method.
+4. Merging of overlapping G4Hunter-positive windows.
+"""
 
 from __future__ import annotations
 
 import re
+
 import pandas as pd
 
 
@@ -13,15 +21,22 @@ CANONICAL_RG4_PATTERN = re.compile(
 )
 
 
-def calculate_g4hunter_scores(sequence: str) -> list[int]:
-    """
-    Assign run-based G4Hunter scores.
+RESULT_COLUMNS = [
+    "sequence_id",
+    "start",
+    "end",
+    "candidate_sequence",
+    "candidate_type",
+    "score",
+    "score_type",
+    "length",
+    "n_windows",
+    "method",
+]
 
-    Consecutive G bases receive positive scores.
-    Consecutive C bases receive negative scores.
-    Run scores are capped at 4.
-    A and U receive zero.
-    """
+
+def calculate_g4hunter_scores(sequence: str) -> list[int]:
+    """Calculate run-based G4Hunter-style nucleotide scores."""
     sequence = sequence.upper().replace("T", "U")
     scores = [0] * len(sequence)
 
@@ -42,14 +57,22 @@ def calculate_g4hunter_scores(sequence: str) -> list[int]:
         run_length = end - index
         magnitude = min(run_length, 4)
 
-        score = magnitude if base == "G" else -magnitude
+        value = magnitude if base == "G" else -magnitude
 
         for position in range(index, end):
-            scores[position] = score
+            scores[position] = value
 
         index = end
 
     return scores
+
+
+def calculate_window_score(scores: list[int]) -> float:
+    """Calculate the mean nucleotide score for a window."""
+    if not scores:
+        return 0.0
+
+    return sum(scores) / len(scores)
 
 
 def _merge_window_hits(
@@ -57,7 +80,7 @@ def _merge_window_hits(
     hits: list[dict],
     sequence_id: str,
 ) -> list[dict]:
-    """Merge overlapping G4Hunter-positive sliding windows."""
+    """Merge overlapping G4Hunter-positive windows."""
     if not hits:
         return []
 
@@ -77,37 +100,40 @@ def _merge_window_hits(
 
     groups.append(current)
 
-    merged = []
+    results = []
 
     for group in groups:
         start = min(item["start"] for item in group)
         end = max(item["end"] for item in group)
 
         candidate = sequence[start:end]
-        candidate_scores = calculate_g4hunter_scores(candidate)
 
-        merged.append({
+        # Average of the qualifying sliding-window scores.
+        mean_window_score = sum(
+            item["window_score"] for item in group
+        ) / len(group)
+
+        results.append({
             "sequence_id": sequence_id,
             "start": start,
             "end": end,
             "candidate_sequence": candidate,
             "candidate_type": "g4hunter",
-            "score": round(
-                sum(candidate_scores) / len(candidate_scores), 4
-            ),
-            "length": len(candidate),
+            "score": round(mean_window_score, 4),
+            "score_type": "Mean G4Hunter window score",
+            "length": end - start,
             "n_windows": len(group),
-            "method": "G4Hunter-style",
+            "method": "G4Hunter-style sliding window",
         })
 
-    return merged
+    return results
 
 
 def _find_canonical_motifs(
     sequence: str,
     sequence_id: str,
 ) -> list[dict]:
-    """Identify canonical four-tract G-rich RNA motif candidates."""
+    """Find canonical four-tract G-rich RNA motif candidates."""
     results = []
 
     for match in CANONICAL_RG4_PATTERN.finditer(sequence):
@@ -117,16 +143,21 @@ def _find_canonical_motifs(
 
         scores = calculate_g4hunter_scores(candidate)
 
+        # This is a descriptive composition score, NOT a
+        # G4Hunter sliding-window score.
+        composition_score = calculate_window_score(scores)
+
         results.append({
             "sequence_id": sequence_id,
             "start": start,
             "end": end,
             "candidate_sequence": candidate,
             "candidate_type": "canonical_motif",
-            "score": round(sum(scores) / len(scores), 4),
+            "score": round(composition_score, 4),
+            "score_type": "Motif composition score",
             "length": len(candidate),
             "n_windows": 0,
-            "method": "Canonical G-tract motif",
+            "method": "Canonical four-tract G-rich motif",
         })
 
     return results
@@ -138,12 +169,16 @@ def scan_rg4(
     score_threshold: float = 1.2,
 ) -> pd.DataFrame:
     """
-    Identify RNA G4 candidate regions using:
+    Screen RNA sequences using two independent approaches.
 
-    1. G4Hunter-style sliding-window scoring.
-    2. Independent canonical four-tract motif screening.
+    G4Hunter-style:
+        Positive G-rich sliding-window scores.
 
-    Overlapping positive windows are merged into candidate regions.
+    Canonical motif:
+        Four G-rich tracts separated by short loop regions.
+
+    The two methods are reported separately. Their intervals may overlap
+    and should not be interpreted as independent structures.
     """
     required = {"sequence_id", "sequence"}
 
@@ -167,7 +202,10 @@ def scan_rg4(
         if not sequence:
             continue
 
-        scores = calculate_g4hunter_scores(sequence)
+        if set(sequence) - set("ACGUNRYKMSWBDHV"):
+            continue
+
+        nucleotide_scores = calculate_g4hunter_scores(sequence)
 
         # G4Hunter-style sliding-window analysis.
         if len(sequence) >= window_size:
@@ -176,8 +214,8 @@ def scan_rg4(
             for start in range(len(sequence) - window_size + 1):
                 end = start + window_size
 
-                window_score = (
-                    sum(scores[start:end]) / window_size
+                window_score = calculate_window_score(
+                    nucleotide_scores[start:end]
                 )
 
                 if window_score >= score_threshold:
@@ -200,22 +238,10 @@ def scan_rg4(
             _find_canonical_motifs(sequence, sequence_id)
         )
 
-    columns = [
-        "sequence_id",
-        "start",
-        "end",
-        "candidate_sequence",
-        "candidate_type",
-        "score",
-        "length",
-        "n_windows",
-        "method",
-    ]
-
     if not output:
-        return pd.DataFrame(columns=columns)
+        return pd.DataFrame(columns=RESULT_COLUMNS)
 
-    result = pd.DataFrame(output, columns=columns)
+    result = pd.DataFrame(output, columns=RESULT_COLUMNS)
 
     return result.sort_values(
         ["sequence_id", "start", "end", "candidate_type"]
