@@ -120,7 +120,7 @@ def check_hg38_assembly(mapping):
 
     incompatible = [
         assembly for assembly in assemblies
-        if "GRCh38" not in assembly.upper()
+        if "GRCH38" not in assembly.upper()
     ]
 
     if incompatible:
