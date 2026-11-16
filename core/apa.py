@@ -47,7 +47,7 @@ def _clean_column_name(value):
 
 
 def _read_database_archive(content):
-    """Read tabular files from the PolyA_DB ZIP archive."""
+    """Read the Main human PAS table from the ZIP archive."""
 
     frames = []
     diagnostics = []
@@ -100,38 +100,46 @@ def _read_database_archive(content):
 
 
 def _parse_pas_id(value):
-    """Attempt to decode chromosome, position and strand."""
+    """
+    Decode PolyA_DB PAS identifiers.
+
+    Actual PolyA_DB format:
+        chr12:-:57517847
+        chr22:+:39521193
+
+    Returns:
+        chromosome, 1-based position, strand
+    """
 
     value = str(value).strip()
 
-    patterns = [
-        r"^(chr(?:[0-9]+|X|Y|M|MT))[:_|\-](\d+)[:_|\-]([+-])$",
+    pattern = (
+        r"^(chr(?:[0-9]+|X|Y|M|MT)):"
+        r"([+-]):"
+        r"(\d+)$"
+    )
 
-        r"^(?:.*?)(chr(?:[0-9]+|X|Y|M|MT))[:_|\-](\d+)[:_|\-]([+-])$",
-    ]
+    match = re.match(
+        pattern,
+        value,
+        flags=re.IGNORECASE,
+    )
 
-    for pattern in patterns:
+    if not match:
+        return None
 
-        match = re.search(
-            pattern,
-            value,
-            flags=re.IGNORECASE,
-        )
+    chrom = match.group(1)
+    strand = match.group(2)
+    position = int(match.group(3))
 
-        if match:
+    if position <= 0:
+        return None
 
-            chrom = match.group(1)
-            position = int(match.group(2))
-            strand = match.group(3)
-
-            if position > 0:
-                return chrom, position, strand
-
-    return None
+    return chrom, position, strand
 
 
 def _extract_gene_annotations(frames, gene_symbols):
-    """Extract requested genes and decode their PAS identifiers."""
+    """Extract APA annotations for the selected genes."""
 
     gene_aliases = [
         "genesymbol",
@@ -209,7 +217,6 @@ def _extract_gene_annotations(frames, gene_symbols):
         if working.empty:
             continue
 
-        # Keep real PAS identifiers for diagnostics.
         pas_id_examples.extend(
             working[pas_id_col]
             .dropna()
@@ -247,13 +254,15 @@ def _extract_gene_annotations(frames, gene_symbols):
             )
         )
 
-        # Convert 1-based position to 0-based,
-        # half-open BED coordinates.
+        # Convert 1-based cleavage position
+        # to 0-based, half-open BED coordinates.
         working["start"] = (
             working["_position"] - 1
         )
 
-        working["end"] = working["_position"]
+        working["end"] = (
+            working["_position"]
+        )
 
         if type_col:
 
@@ -290,7 +299,6 @@ def _extract_gene_annotations(frames, gene_symbols):
             "source": "PolyA_DB_v4.1",
         })
 
-        # Preserve additional available database fields.
         additional_columns = [
             "pas_type_refseq_label",
             "pas_lrtype_label",
@@ -318,12 +326,12 @@ def _extract_gene_annotations(frames, gene_symbols):
         examples = (
             " | ".join(pas_id_examples[:15])
             if pas_id_examples
-            else "No PAS identifiers were found for the selected genes."
+            else "No PAS identifiers found."
         )
 
         raise ValueError(
-            "Could not decode PolyA_DB PAS identifiers.\n\n"
-            "Sample PAS IDs:\n"
+            "Could not extract APA records.\n"
+            "Sample PAS IDs: "
             + examples
         )
 
@@ -337,7 +345,7 @@ def fetch_apa_sites(
     gene_symbols=None,
     timeout=90,
 ):
-    """Retrieve human APA annotations from PolyA_DB v4.1."""
+    """Download and retrieve human APA annotations."""
 
     if gene_symbols is None:
         gene_symbols = GENE_SYMBOLS
@@ -403,9 +411,7 @@ def fetch_apa_sites(
     ).reset_index(drop=True)
 
     result.attrs["source"] = "PolyA_DB v4.1"
-
     result.attrs["assembly"] = POLYA_DB_ASSEMBLY
-
     result.attrs["genes_requested"] = gene_symbols
 
     return result
