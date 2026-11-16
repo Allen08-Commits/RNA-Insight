@@ -1405,8 +1405,9 @@ elif page == "Integrated rG4–APA analysis":
 
 
 
+
 # --------------------------------------------------
-# 05 REPORT
+# 05 RESULTS & PDF RESEARCH REPORT
 # --------------------------------------------------
 
 elif page == "Results & report":
@@ -1424,57 +1425,79 @@ elif page == "Results & report":
         apa = pd.DataFrame()
 
     if integrated is None:
-        integrated = pd.DataFrame()
+        integrated = None
 
-    # Report summary metrics
+    # -----------------------------
+    # SUMMARY METRICS
+    # -----------------------------
+
     c1, c2, c3 = st.columns(3)
 
     c1.metric(
         "rG4 candidate intervals",
-        len(rg4)
+        len(rg4),
     )
 
     c2.metric(
         "APA annotation sites",
-        len(apa)
+        len(apa),
     )
 
     c3.metric(
         "Integrated candidates",
-        len(integrated)
+        len(integrated) if integrated is not None else 0,
     )
 
-    # Generate report content
+    st.divider()
+
+    # -----------------------------
+    # GENERATE REPORT
+    # -----------------------------
+
+    from core.report import build_pdf_report
+
+    try:
+        pdf_bytes = build_pdf_report(
+            rg4_candidates=rg4,
+            apa_sites=apa,
+            integrated_results=integrated,
+        )
+
+        st.success(
+            "Your research report is ready in PDF format."
+        )
+
+        st.download_button(
+            label="📄 Download RNA-Insight Research Report (PDF)",
+            data=pdf_bytes,
+            file_name="RNA_Insight_Research_Report.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
+
+    except Exception as exc:
+        st.error(
+            f"PDF report generation failed: {exc}"
+        )
+
+    st.divider()
+
+    # -----------------------------
+    # MARKDOWN PREVIEW
+    # -----------------------------
+
+    st.subheader("Report preview")
+
     report = build_report(
         rg4_candidates=rg4,
         apa_sites=apa,
         integrated_results=integrated,
     )
 
-    # Generate PDF
-    try:
-        pdf_data = build_pdf_report(report)
+    with st.expander("View complete report text"):
+        st.markdown(report)
 
-        st.download_button(
-            label="📄 Download research report (PDF)",
-            data=pdf_data,
-            file_name="RNA_Insight_Research_Report.pdf",
-            mime="application/pdf",
-            use_container_width=True,
-        )
-
-        st.success(
-            "Your PDF research report is ready to download."
-        )
-
-    except Exception as exc:
-        st.error(
-            f"PDF generation failed: {exc}"
-        )
-
-    # Report preview
-    st.divider()
-
-    st.subheader("Report preview")
-
-    st.markdown(report)
+    st.caption(
+        "The PDF contains the analysis summaries, candidate tables, "
+        "APA annotations, integrated results and scientific limitations."
+    )
