@@ -6,6 +6,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from io import BytesIO
 from xml.sax.saxutils import escape
+import re
 
 import pandas as pd
 
@@ -18,7 +19,8 @@ from reportlab.platypus import (
     SimpleDocTemplate,
     Paragraph,
     Spacer,
-    PageBreak,
+    Table,
+    TableStyle,
 )
 
 
@@ -91,6 +93,7 @@ def build_report(
         ])
 
         if not integrated_results.empty:
+
             overlap_column = (
                 "overlaps_gene_level_apa"
                 if "overlaps_gene_level_apa" in integrated_results.columns
@@ -99,7 +102,10 @@ def build_report(
 
             if overlap_column in integrated_results.columns:
                 overlap_count = int(
-                    integrated_results[overlap_column].fillna(False).sum()
+                    integrated_results[overlap_column]
+                    .fillna(False)
+                    .astype(bool)
+                    .sum()
                 )
             else:
                 overlap_count = 0
@@ -126,7 +132,6 @@ def build_report(
         "biological replicates and suitable statistical testing.",
         "- Sequence mapping and APA annotations must use compatible "
         "genome assemblies and coordinate conventions.",
-        "- Demonstration data supplied with this application are synthetic.",
         "",
         "## Reproducibility",
         "",
@@ -140,17 +145,17 @@ def build_report(
 
 
 def build_pdf_report(report_markdown: str) -> bytes:
-    """Convert the generated Markdown report into a downloadable PDF."""
+    """Convert RNA-Insight Markdown report into a formatted PDF."""
 
     buffer = BytesIO()
 
     document = SimpleDocTemplate(
         buffer,
         pagesize=landscape(A4),
-        rightMargin=15 * mm,
-        leftMargin=15 * mm,
-        topMargin=17 * mm,
-        bottomMargin=17 * mm,
+        rightMargin=12 * mm,
+        leftMargin=12 * mm,
+        topMargin=15 * mm,
+        bottomMargin=15 * mm,
         title="RNA-Insight Research Report",
         author="RNA-Insight",
     )
@@ -158,38 +163,37 @@ def build_pdf_report(report_markdown: str) -> bytes:
     styles = getSampleStyleSheet()
 
     styles.add(ParagraphStyle(
-        name="ReportTitle",
+        name="RNAReportTitle",
         parent=styles["Title"],
-        fontName="Helvetica-Bold",
         fontSize=22,
         leading=27,
         alignment=TA_CENTER,
-        textColor=colors.HexColor("#087E9B"),
-        spaceAfter=14,
+        textColor=colors.HexColor("#087F9B"),
+        spaceAfter=16,
     ))
 
     styles.add(ParagraphStyle(
-        name="ReportHeading",
+        name="RNAReportHeading",
         parent=styles["Heading1"],
         fontSize=16,
         leading=20,
-        textColor=colors.HexColor("#087E9B"),
-        spaceBefore=13,
-        spaceAfter=8,
+        textColor=colors.HexColor("#087F9B"),
+        spaceBefore=12,
+        spaceAfter=7,
     ))
 
     styles.add(ParagraphStyle(
-        name="ReportSubheading",
+        name="RNAReportSubheading",
         parent=styles["Heading2"],
         fontSize=12,
         leading=15,
-        textColor=colors.HexColor("#563B91"),
-        spaceBefore=9,
+        textColor=colors.HexColor("#6045A5"),
+        spaceBefore=8,
         spaceAfter=5,
     ))
 
     styles.add(ParagraphStyle(
-        name="ReportBody",
+        name="RNAReportBody",
         parent=styles["BodyText"],
         fontSize=9,
         leading=13,
@@ -197,89 +201,158 @@ def build_pdf_report(report_markdown: str) -> bytes:
     ))
 
     styles.add(ParagraphStyle(
-        name="ReportBullet",
+        name="RNAReportSmall",
         parent=styles["BodyText"],
-        fontSize=9,
-        leading=12,
-        leftIndent=14,
-        firstLineIndent=-8,
-        spaceAfter=4,
-    ))
-
-    styles.add(ParagraphStyle(
-        name="ReportTableLine",
-        parent=styles["Code"],
-        fontName="Courier",
-        fontSize=5.5,
-        leading=7,
-        spaceAfter=2,
+        fontSize=6,
+        leading=8,
         wordWrap="CJK",
     ))
 
     story = []
+    table_lines = []
+
+    def clean_markdown(value):
+        value = re.sub(r"\*\*(.*?)\*\*", r"\1", value)
+        value = re.sub(r"\*(.*?)\*", r"\1", value)
+        value = re.sub(r"`(.*?)`", r"\1", value)
+        return value.strip()
+
+    def flush_table():
+        nonlocal table_lines
+
+        if not table_lines:
+            return
+
+        rows = []
+
+        for line in table_lines:
+            cells = [
+                cell.strip()
+                for cell in line.strip().strip("|").split("|")
+            ]
+
+            # Skip Markdown separator rows
+            if all(
+                re.fullmatch(r":?-{3,}:?", cell.replace(" ", ""))
+                for cell in cells
+            ):
+                continue
+
+            rows.append(cells)
+
+        if rows:
+            max_columns = max(len(row) for row in rows)
+
+            normalized_rows = [
+                row + [""] * (max_columns - len(row))
+                for row in rows
+            ]
+
+            pdf_rows = []
+
+            for row_index, row in enumerate(normalized_rows):
+                formatted_row = []
+
+                for cell in row:
+                    formatted_row.append(
+                        Paragraph(
+                            escape(clean_markdown(cell)),
+                            styles["RNAReportSmall"],
+                        )
+                    )
+
+                pdf_rows.append(formatted_row)
+
+            available_width = landscape(A4)[0] - 24 * mm
+            col_width = available_width / max_columns
+
+            table = Table(
+                pdf_rows,
+                colWidths=[col_width] * max_columns,
+                repeatRows=1,
+                hAlign="LEFT",
+            )
+
+            table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0),
+                 colors.HexColor("#DCEEF5")),
+                ("TEXTCOLOR", (0, 0), (-1, 0),
+                 colors.HexColor("#123A55")),
+                ("GRID", (0, 0), (-1, -1), 0.35,
+                 colors.HexColor("#B8C9D6")),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ]))
+
+            story.append(Spacer(1, 5))
+            story.append(table)
+            story.append(Spacer(1, 8))
+
+        table_lines = []
 
     for raw_line in report_markdown.splitlines():
         line = raw_line.strip()
 
+        if line.startswith("|"):
+            table_lines.append(line)
+            continue
+
+        flush_table()
+
         if not line:
-            story.append(Spacer(1, 3))
+            story.append(Spacer(1, 4))
             continue
 
         if line == "---":
-            story.append(Spacer(1, 5))
+            story.append(Spacer(1, 8))
             continue
 
         if line.startswith("# "):
             story.append(Paragraph(
-                escape(line[2:]),
-                styles["ReportTitle"]
+                escape(clean_markdown(line[2:])),
+                styles["RNAReportTitle"],
             ))
 
         elif line.startswith("## "):
             story.append(Paragraph(
-                escape(line[3:]),
-                styles["ReportHeading"]
+                escape(clean_markdown(line[3:])),
+                styles["RNAReportHeading"],
             ))
 
         elif line.startswith("### "):
             story.append(Paragraph(
-                escape(line[4:]),
-                styles["ReportSubheading"]
+                escape(clean_markdown(line[4:])),
+                styles["RNAReportSubheading"],
             ))
 
         elif line.startswith("- "):
-            content = escape(line[2:])
             story.append(Paragraph(
-                "• " + content,
-                styles["ReportBullet"]
-            ))
-
-        elif line.startswith("|"):
-            # Keep wide scientific table rows readable and wrapped.
-            table_text = escape(line.replace("|", " | "))
-            story.append(Paragraph(
-                table_text,
-                styles["ReportTableLine"]
+                "&#8226; " + escape(clean_markdown(line[2:])),
+                styles["RNAReportBody"],
             ))
 
         else:
-            # Basic Markdown bold formatting.
-            safe_line = escape(line)
-            safe_line = safe_line.replace("**", "")
             story.append(Paragraph(
-                safe_line,
-                styles["ReportBody"]
+                escape(clean_markdown(line)),
+                styles["RNAReportBody"],
             ))
+
+    flush_table()
 
     def add_page_number(canvas, doc):
         canvas.saveState()
         canvas.setFont("Helvetica", 8)
         canvas.setFillColor(colors.grey)
+
         canvas.drawRightString(
-            landscape(A4)[0] - 15 * mm,
-            9 * mm,
+            landscape(A4)[0] - 12 * mm,
+            8 * mm,
             f"RNA-Insight | Page {doc.page}",
         )
+
         canvas.restoreState()
 
     document.build(
