@@ -1,13 +1,21 @@
 
-"""Genomic integration of RNA G4 candidates and APA annotations.
+"""Exon-aware genomic integration of RNA G4 candidates and APA sites.
 
-Coordinates:
-- Sequence candidate coordinates: 0-based, half-open.
-- Mapping start/end: 0-based, half-open genomic coordinates.
-- APA start/end: expected to be 0-based, half-open.
+Coordinate conventions:
+- rG4 candidate coordinates: 0-based, half-open transcript coordinates.
+- Exon genomic coordinates: 0-based, half-open.
+- Exon transcript coordinates: 0-based, half-open.
+- APA genomic coordinates: 0-based, half-open.
 
-All inputs must use the same genome assembly and compatible
-transcript-to-genome mapping conventions.
+The mapping table must contain one row per exon, not one row per
+whole transcript.
+
+Required mapping columns:
+sequence_id, chrom, start, end, strand, transcript_start,
+transcript_end
+
+The mapping and APA annotation files must use the same genome
+assembly and chromosome naming convention.
 """
 
 from __future__ import annotations
@@ -21,6 +29,8 @@ MAPPING_REQUIRED = {
     "start",
     "end",
     "strand",
+    "transcript_start",
+    "transcript_end",
 }
 
 RG4_REQUIRED = {
@@ -40,13 +50,8 @@ APA_REQUIRED = {
 }
 
 
-def _validate_columns(
-    frame: pd.DataFrame,
-    required: set[str],
-    label: str,
-) -> None:
+def _validate_columns(frame, required, label):
     missing = required - set(frame.columns)
-
     if missing:
         raise ValueError(
             f"{label} is missing required columns: "
@@ -54,39 +59,196 @@ def _validate_columns(
         )
 
 
-def _prepare_coordinates(
-    frame: pd.DataFrame,
-    label: str,
-) -> pd.DataFrame:
-    """Convert coordinate fields to numeric values and validate them."""
+def _numeric_coordinates(frame, columns, label):
     result = frame.copy()
 
-    for column in ("start", "end"):
+    for column in columns:
         result[column] = pd.to_numeric(
-            result[column],
-            errors="coerce",
+            result[column], errors="coerce"
         )
 
-    if result[["start", "end"]].isna().any().any():
+    if result[columns].isna().any().any():
         raise ValueError(
-            f"{label} contains non-numeric or missing coordinates."
+            f"{label} contains missing or non-numeric coordinates."
         )
 
-    if (result["start"] < 0).any():
-        raise ValueError(
-            f"{label} contains negative start coordinates."
-        )
+    for column in columns:
+        if (result[column] < 0).any():
+            raise ValueError(
+                f"{label} contains negative coordinates."
+            )
 
-    if (result["end"] <= result["start"]).any():
-        raise ValueError(
-            f"{label} contains invalid intervals. "
-            "End must be greater than start."
-        )
+        if (result[column] % 1 != 0).any():
+            raise ValueError(
+                f"{label} coordinates must be integers."
+            )
 
-    result["start"] = result["start"].astype(int)
-    result["end"] = result["end"].astype(int)
+        result[column] = result[column].astype(int)
 
     return result
+
+
+def _prepare_mapping(mapping):
+    mapping = _numeric_coordinates(
+        mapping,
+        ["start", "end", "transcript_start", "transcript_end"],
+        "Exon mapping",
+    )
+
+    if (mapping["end"] <= mapping["start"]).any():
+        raise ValueError("Exon genomic end must exceed start.")
+
+    if (
+        mapping["transcript_end"] <= mapping["transcript_start"]
+    ).any():
+        raise ValueError("Exon transcript end must exceed start.")
+
+    mapping["sequence_id"] = mapping["sequence_id"].astype(str).str.strip()
+    mapping["chrom"] = mapping["chrom"].astype(str).str.strip()
+    mapping["strand"] = mapping["strand"].astype(str).str.strip()
+
+    if not mapping["strand"].isin(["+", "-"]).all():
+        raise ValueError("Mapping strand must be '+' or '-'.")
+
+    genomic_lengths = mapping["end"] - mapping["start"]
+    transcript_lengths = (
+        mapping["transcript_end"] - mapping["transcript_start"]
+    )
+
+    if not (genomic_lengths == transcript_lengths).all():
+        raise ValueError(
+            "Each exon must have equal genomic and transcript lengths."
+        )
+
+    mapping = mapping.sort_values(
+        ["sequence_id", "transcript_start"]
+    ).reset_index(drop=True)
+
+    for sequence_id, group in mapping.groupby("sequence_id"):
+        if group["chrom"].nunique() != 1:
+            raise ValueError(
+                f"Transcript {sequence_id} maps to multiple chromosomes."
+            )
+
+        if group["strand"].nunique() != 1:
+            raise ValueError(
+                f"Transcript {sequence_id} has inconsistent strands."
+            )
+
+        if group["transcript_start"].iloc[0] != 0:
+            raise ValueError(
+                f"Transcript {sequence_id} mapping does not start at 0."
+            )
+
+        if (
+            group["transcript_end"].iloc[:-1].to_numpy()
+            != group["transcript_start"].iloc[1:].to_numpy()
+        ).any():
+            raise ValueError(
+                f"Transcript {sequence_id} has gaps or overlaps "
+                "in transcript-coordinate exon mapping."
+            )
+
+        if group["strand"].iloc[0] == "+":
+            genomic_order = group.sort_values("start")
+        else:
+            genomic_order = group.sort_values(
+                "start", ascending=False
+            )
+
+        genomic_starts = genomic_order["start"].to_numpy()
+        genomic_ends = genomic_order["end"].to_numpy()
+
+        if len(genomic_starts) > 1:
+            if (
+                group["strand"].iloc[0] == "+"
+                and (genomic_ends[:-1] > genomic_starts[1:]).any()
+            ):
+                raise ValueError(
+                    f"Overlapping genomic exons found for {sequence_id}."
+                )
+
+            if (
+                group["strand"].iloc[0] == "-"
+                and (genomic_starts[:-1] < genomic_ends[1:]).any()
+            ):
+                raise ValueError(
+                    f"Overlapping genomic exons found for {sequence_id}."
+                )
+
+    return mapping
+
+
+def _map_candidate_to_exons(candidate, exon_rows):
+    """Map a transcript candidate to one or more genomic exon segments."""
+    local_start = int(candidate["start"])
+    local_end = int(candidate["end"])
+
+    transcript_length = int(
+        exon_rows["transcript_end"].max()
+    )
+
+    if local_end > transcript_length:
+        raise ValueError(
+            f"Candidate {candidate['sequence_id']}:"
+            f"{local_start}-{local_end} exceeds transcript length "
+            f"{transcript_length}."
+        )
+
+    segments = []
+    covered_bases = 0
+
+    for exon in exon_rows.itertuples(index=False):
+        overlap_start = max(
+            local_start, int(exon.transcript_start)
+        )
+        overlap_end = min(
+            local_end, int(exon.transcript_end)
+        )
+
+        if overlap_start >= overlap_end:
+            continue
+
+        covered_bases += overlap_end - overlap_start
+
+        if exon.strand == "+":
+            genomic_start = (
+                int(exon.start)
+                + overlap_start
+                - int(exon.transcript_start)
+            )
+            genomic_end = (
+                int(exon.start)
+                + overlap_end
+                - int(exon.transcript_start)
+            )
+        else:
+            genomic_start = (
+                int(exon.end)
+                - (overlap_end - int(exon.transcript_start))
+            )
+            genomic_end = (
+                int(exon.end)
+                - (overlap_start - int(exon.transcript_start))
+            )
+
+        segments.append({
+            "chrom": str(exon.chrom),
+            "start": genomic_start,
+            "end": genomic_end,
+            "strand": str(exon.strand),
+            "transcript_start": overlap_start,
+            "transcript_end": overlap_end,
+        })
+
+    if covered_bases != local_end - local_start:
+        raise ValueError(
+            f"Candidate {candidate['sequence_id']}:"
+            f"{local_start}-{local_end} is not completely covered "
+            "by the supplied exon mapping."
+        )
+
+    return segments
 
 
 def integrate_rg4_apa(
@@ -95,191 +257,165 @@ def integrate_rg4_apa(
     sequence_mapping: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Map RNA candidate intervals to genomic coordinates and
-    identify overlaps with APA annotations.
+    Map rG4 candidates through exon coordinates and detect APA overlaps.
 
-    The mapping table must contain one genomic interval per
-    input sequence. Candidate local coordinates are added to
-    the mapping start coordinate.
+    APA sequence_id must identify the same transcript as the
+    rG4 candidate and exon mapping.
 
-    Overlap is calculated using half-open intervals:
-        candidate_start < apa_end
-        candidate_end > apa_start
-
-    Chromosome, strand and sequence identifier must match.
+    Candidates spanning exon junctions are represented by multiple
+    genomic segments. An overlap is reported if any segment overlaps
+    an APA interval on the same chromosome and strand.
     """
     _validate_columns(
-        rg4_candidates,
-        RG4_REQUIRED,
-        "rG4 candidate table",
+        rg4_candidates, RG4_REQUIRED, "rG4 candidate table"
+    )
+    _validate_columns(
+        apa_sites, APA_REQUIRED, "APA annotation table"
+    )
+    _validate_columns(
+        sequence_mapping, MAPPING_REQUIRED, "Exon mapping table"
     )
 
-    _validate_columns(
-        apa_sites,
-        APA_REQUIRED,
-        "APA annotation table",
-    )
-
-    _validate_columns(
-        sequence_mapping,
-        MAPPING_REQUIRED,
-        "Sequence mapping table",
-    )
+    output_columns = [
+        "sequence_id",
+        "candidate_start",
+        "candidate_end",
+        "chrom",
+        "genomic_segments",
+        "strand",
+        "candidate_type",
+        "score",
+        "overlaps_apa",
+        "overlapping_apa_sites",
+        "overlapping_apa_types",
+        "overlapping_apa_coordinates",
+    ]
 
     if rg4_candidates.empty:
-        return pd.DataFrame(columns=[
-            "sequence_id",
-            "candidate_start",
-            "candidate_end",
-            "chrom",
-            "genomic_start",
-            "genomic_end",
-            "strand",
-            "candidate_type",
-            "score",
-            "overlaps_apa",
-            "overlapping_apa_sites",
-            "overlapping_apa_types",
-            "overlapping_apa_coordinates",
-        ])
+        return pd.DataFrame(columns=output_columns)
 
-    candidates = rg4_candidates.copy()
-    mappings = sequence_mapping.copy()
-    apa = apa_sites.copy()
-
-    # Validate candidate coordinates.
-    candidates["start"] = pd.to_numeric(
-        candidates["start"],
-        errors="coerce",
-    )
-    candidates["end"] = pd.to_numeric(
-        candidates["end"],
-        errors="coerce",
+    candidates = _numeric_coordinates(
+        rg4_candidates,
+        ["start", "end"],
+        "rG4 candidates",
     )
 
-    if candidates[["start", "end"]].isna().any().any():
-        raise ValueError(
-            "rG4 candidates contain invalid coordinates."
-        )
+    if (candidates["end"] <= candidates["start"]).any():
+        raise ValueError("rG4 candidate intervals are invalid.")
 
-    if (
-        (candidates["start"] < 0)
-        | (candidates["end"] <= candidates["start"])
-    ).any():
-        raise ValueError(
-            "rG4 candidates must have valid 0-based half-open intervals."
-        )
-
-    candidates["start"] = candidates["start"].astype(int)
-    candidates["end"] = candidates["end"].astype(int)
-
-    mappings = _prepare_coordinates(
-        mappings,
-        "Sequence mapping table",
+    candidates["sequence_id"] = (
+        candidates["sequence_id"].astype(str).str.strip()
     )
 
-    apa = _prepare_coordinates(
-        apa,
-        "APA annotation table",
+    mapping = _prepare_mapping(sequence_mapping)
+
+    apa = _numeric_coordinates(
+        apa_sites,
+        ["start", "end"],
+        "APA annotation",
     )
 
-    # Normalize chromosome and strand labels.
-    for frame in (mappings, apa):
-        frame["chrom"] = frame["chrom"].astype(str).str.strip()
-        frame["strand"] = frame["strand"].astype(str).str.strip()
+    if (apa["end"] <= apa["start"]).any():
+        raise ValueError("APA intervals are invalid.")
 
-    if not mappings["strand"].isin(["+", "-"]).all():
-        raise ValueError(
-            "Mapping strand must be '+' or '-'."
-        )
+    apa["sequence_id"] = apa["sequence_id"].astype(str).str.strip()
+    apa["chrom"] = apa["chrom"].astype(str).str.strip()
+    apa["strand"] = apa["strand"].astype(str).str.strip()
+    apa["site_type"] = apa["site_type"].fillna(
+        "unspecified"
+    ).astype(str)
 
     if not apa["strand"].isin(["+", "-"]).all():
-        raise ValueError(
-            "APA strand must be '+' or '-'."
-        )
+        raise ValueError("APA strand must be '+' or '-'.")
 
-    if mappings["sequence_id"].duplicated().any():
-        raise ValueError(
-            "Mapping table must contain one row per sequence_id."
-        )
+    mapping_groups = {
+        sequence_id: group.copy()
+        for sequence_id, group in mapping.groupby("sequence_id")
+    }
 
-    mapping_lookup = mappings.set_index("sequence_id").to_dict(
-        orient="index"
-    )
+    apa_groups = {
+        sequence_id: group.copy()
+        for sequence_id, group in apa.groupby("sequence_id")
+    }
 
     results = []
 
-    for _, candidate in candidates.iterrows():
-        sequence_id = candidate["sequence_id"]
+    for candidate in candidates.itertuples(index=False):
+        sequence_id = str(candidate.sequence_id)
 
-        if sequence_id not in mapping_lookup:
+        if sequence_id not in mapping_groups:
             raise ValueError(
-                f"No genomic mapping found for sequence_id "
-                f"'{sequence_id}'."
+                f"No exon mapping found for transcript {sequence_id}."
             )
 
-        mapping = mapping_lookup[sequence_id]
+        exon_rows = mapping_groups[sequence_id]
 
-        local_start = int(candidate["start"])
-        local_end = int(candidate["end"])
-
-        mapping_start = int(mapping["start"])
-        mapping_end = int(mapping["end"])
-
-        sequence_length = mapping_end - mapping_start
-
-        if local_end > sequence_length:
-            raise ValueError(
-                f"Candidate {sequence_id}:{local_start}-{local_end} "
-                "extends beyond its mapped sequence interval."
-            )
-
-        genomic_start = mapping_start + local_start
-        genomic_end = mapping_start + local_end
-
-        chromosome = str(mapping["chrom"])
-        strand = str(mapping["strand"])
-
-        matching_apa = apa[
-            (apa["sequence_id"] == sequence_id)
-            & (apa["chrom"] == chromosome)
-            & (apa["strand"] == strand)
-            & (apa["start"] < genomic_end)
-            & (apa["end"] > genomic_start)
-        ].copy()
-
-        overlapping_types = sorted(
-            matching_apa["site_type"]
-            .astype(str)
-            .unique()
-            .tolist()
+        segments = _map_candidate_to_exons(
+            {
+                "sequence_id": sequence_id,
+                "start": candidate.start,
+                "end": candidate.end,
+            },
+            exon_rows,
         )
 
-        overlapping_coordinates = [
-            f"{row.chrom}:{row.start}-{row.end} ({row.site_type})"
-            for row in matching_apa.itertuples()
+        transcript_chrom = str(exon_rows["chrom"].iloc[0])
+        transcript_strand = str(exon_rows["strand"].iloc[0])
+
+        transcript_apa = apa_groups.get(
+            sequence_id,
+            pd.DataFrame(columns=apa.columns),
+        )
+
+        matching_rows = []
+
+        for segment in segments:
+            matches = transcript_apa[
+                (transcript_apa["chrom"] == segment["chrom"])
+                & (transcript_apa["strand"] == segment["strand"])
+                & (transcript_apa["start"] < segment["end"])
+                & (transcript_apa["end"] > segment["start"])
+            ]
+
+            matching_rows.append(matches)
+
+        if matching_rows:
+            matched = pd.concat(
+                matching_rows, ignore_index=True
+            ).drop_duplicates()
+        else:
+            matched = pd.DataFrame(columns=apa.columns)
+
+        segment_labels = [
+            f"{segment['chrom']}:{segment['start']}-"
+            f"{segment['end']}({segment['strand']})"
+            for segment in segments
         ]
 
-        score = candidate.get("score", None)
+        apa_labels = [
+            f"{row.chrom}:{row.start}-{row.end} ({row.site_type})"
+            for row in matched.itertuples()
+        ]
+
+        apa_types = sorted(
+            matched["site_type"].astype(str).unique().tolist()
+        ) if not matched.empty else []
 
         results.append({
             "sequence_id": sequence_id,
-            "candidate_start": local_start,
-            "candidate_end": local_end,
-            "chrom": chromosome,
-            "genomic_start": genomic_start,
-            "genomic_end": genomic_end,
-            "strand": strand,
-            "candidate_type": candidate["candidate_type"],
-            "score": score,
-            "overlaps_apa": not matching_apa.empty,
-            "overlapping_apa_sites": len(matching_apa),
-            "overlapping_apa_types": ", ".join(overlapping_types),
-            "overlapping_apa_coordinates": "; ".join(
-                overlapping_coordinates
-            ),
+            "candidate_start": int(candidate.start),
+            "candidate_end": int(candidate.end),
+            "chrom": transcript_chrom,
+            "genomic_segments": "; ".join(segment_labels),
+            "strand": transcript_strand,
+            "candidate_type": candidate.candidate_type,
+            "score": getattr(candidate, "score", None),
+            "overlaps_apa": not matched.empty,
+            "overlapping_apa_sites": int(len(matched)),
+            "overlapping_apa_types": ", ".join(apa_types),
+            "overlapping_apa_coordinates": "; ".join(apa_labels),
         })
 
-    return pd.DataFrame(results).sort_values(
-        ["sequence_id", "genomic_start", "genomic_end"]
+    return pd.DataFrame(results, columns=output_columns).sort_values(
+        ["sequence_id", "candidate_start", "candidate_end"]
     ).reset_index(drop=True)
