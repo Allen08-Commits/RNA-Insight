@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 from core.io import (
@@ -28,6 +29,10 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+
+# --------------------------------------------------
+# VISUAL STYLE
+# --------------------------------------------------
 
 st.markdown("""
 <style>
@@ -65,6 +70,155 @@ div.stButton > button:hover {
 """, unsafe_allow_html=True)
 
 
+# --------------------------------------------------
+# HELPER: GENOMIC VISUALIZATION
+# --------------------------------------------------
+
+def create_genomic_figure(
+    integrated: pd.DataFrame,
+    apa_sites: pd.DataFrame,
+    chromosome: str,
+) -> go.Figure:
+    """Plot mapped candidate intervals and APA annotations."""
+
+    fig = go.Figure()
+
+    candidates = integrated[
+        integrated["chrom"].astype(str) == str(chromosome)
+    ].copy()
+
+    apa = apa_sites[
+        apa_sites["chrom"].astype(str) == str(chromosome)
+    ].copy()
+
+    candidate_types = sorted(
+        candidates["candidate_type"].astype(str).unique()
+    )
+
+    # Plot candidate intervals as horizontal genomic segments.
+    for candidate_type in candidate_types:
+
+        subset = candidates[
+            candidates["candidate_type"].astype(str)
+            == candidate_type
+        ]
+
+        x_values = []
+        y_values = []
+        hover_values = []
+
+        for row in subset.itertuples():
+
+            label = (
+                f"{row.sequence_id}<br>"
+                f"{row.candidate_type}<br>"
+                f"Coordinates: {row.genomic_start}-"
+                f"{row.genomic_end}<br>"
+                f"Score: {row.score}<br>"
+                f"APA overlap: {row.overlaps_apa}"
+            )
+
+            x_values.extend([
+                row.genomic_start,
+                row.genomic_end,
+                None,
+            ])
+
+            y_values.extend([
+                "rG4 candidates",
+                "rG4 candidates",
+                None,
+            ])
+
+            hover_values.extend([
+                label,
+                label,
+                None,
+            ])
+
+        fig.add_trace(
+            go.Scatter(
+                x=x_values,
+                y=y_values,
+                mode="lines",
+                name=f"rG4: {candidate_type}",
+                line=dict(width=9),
+                text=hover_values,
+                hovertemplate="%{text}<extra></extra>",
+                connectgaps=False,
+            )
+        )
+
+    # Plot APA annotation intervals as points at interval midpoints.
+    if not apa.empty:
+
+        apa["midpoint"] = (
+            apa["start"] + apa["end"]
+        ) / 2
+
+        apa["site_label"] = (
+            apa["site_type"].astype(str)
+            + " APA site"
+        )
+
+        for site_type in sorted(
+            apa["site_type"].astype(str).unique()
+        ):
+
+            subset = apa[
+                apa["site_type"].astype(str) == site_type
+            ]
+
+            fig.add_trace(
+                go.Scatter(
+                    x=subset["midpoint"],
+                    y=["APA annotations"] * len(subset),
+                    mode="markers",
+                    name=f"APA: {site_type}",
+                    marker=dict(
+                        size=14,
+                        symbol="diamond",
+                        line=dict(width=1),
+                    ),
+                    text=[
+                        (
+                            f"{row.sequence_id}<br>"
+                            f"{row.site_type} APA site<br>"
+                            f"{row.chrom}:{row.start}-{row.end}<br>"
+                            f"Strand: {row.strand}"
+                        )
+                        for row in subset.itertuples()
+                    ],
+                    hovertemplate="%{text}<extra></extra>",
+                )
+            )
+
+    fig.update_layout(
+        title=f"rG4 candidates and APA annotations on {chromosome}",
+        xaxis_title="Genomic coordinate (bp)",
+        yaxis_title="Feature",
+        template="plotly_dark",
+        height=430,
+        hovermode="closest",
+        legend_title="Feature type",
+        margin=dict(l=20, r=20, t=60, b=30),
+    )
+
+    fig.update_yaxes(
+        categoryorder="array",
+        categoryarray=[
+            "APA annotations",
+            "rG4 candidates",
+        ],
+    )
+
+    return fig
+
+
+# --------------------------------------------------
+# HEADER
+# --------------------------------------------------
+
 st.markdown("# 🧬 RNA-Insight")
 
 st.markdown(
@@ -80,7 +234,10 @@ st.caption(
 st.divider()
 
 
-# Session state initialization
+# --------------------------------------------------
+# SESSION STATE
+# --------------------------------------------------
+
 defaults = {
     "fasta_data": None,
     "rg4_results": None,
@@ -93,8 +250,12 @@ for key, value in defaults.items():
         st.session_state[key] = value
 
 
-# Navigation
+# --------------------------------------------------
+# NAVIGATION
+# --------------------------------------------------
+
 with st.sidebar:
+
     st.title("Research workspace")
 
     page = st.radio(
@@ -139,7 +300,7 @@ if page == "Data intake & quality control":
 
             st.session_state.fasta_data = checked_records
 
-            # Invalidate downstream results when input changes.
+            # Invalidate analyses when the sequence input changes.
             st.session_state.rg4_results = None
             st.session_state.integrated_results = None
 
@@ -202,13 +363,13 @@ elif page == "rG4 sequence analysis":
 
     else:
 
-        st.subheader("G4Hunter-style analysis parameters")
+        st.subheader("Prediction parameters")
 
         c1, c2 = st.columns(2)
 
         with c1:
             window_size = st.slider(
-                "Sliding window size (nt)",
+                "G4Hunter sliding window size (nt)",
                 min_value=10,
                 max_value=100,
                 value=25,
@@ -225,9 +386,9 @@ elif page == "rG4 sequence analysis":
             )
 
         st.caption(
-            "G4Hunter-style scoring uses positive G-run scores "
-            "and negative C-run scores. Positive windows are screened "
-            "for G-rich RNA candidate regions."
+            "G4Hunter-style screening evaluates G-rich sliding "
+            "windows. Canonical four-tract motif screening is "
+            "performed independently."
         )
 
         if st.button("Run rG4 screening"):
@@ -258,40 +419,38 @@ elif page == "rG4 sequence analysis":
 
         if results is not None:
 
-            st.subheader("Candidate results")
+            st.subheader("Candidate classification")
 
-            st.metric(
-                "Total candidate regions",
-                len(results),
-            )
+            total = len(results)
 
             if results.empty:
 
                 st.warning(
-                    "No candidate regions were detected "
-                    "using the current parameters."
+                    "No candidates were detected with the "
+                    "current parameters."
                 )
 
             else:
 
-                if "candidate_type" in results.columns:
+                g4hunter_results = results[
+                    results["candidate_type"] == "g4hunter"
+                ]
 
-                    type_counts = (
-                        results["candidate_type"].value_counts()
-                    )
+                canonical_results = results[
+                    results["candidate_type"] == "canonical_motif"
+                ]
 
-                    metric_columns = st.columns(
-                        max(1, len(type_counts))
-                    )
+                c1, c2, c3 = st.columns(3)
 
-                    for column, (name, count) in zip(
-                        metric_columns,
-                        type_counts.items(),
-                    ):
-                        column.metric(
-                            name.replace("_", " ").title(),
-                            int(count),
-                        )
+                c1.metric("Total candidate intervals", total)
+                c2.metric(
+                    "G4Hunter regions",
+                    len(g4hunter_results),
+                )
+                c3.metric(
+                    "Canonical motifs",
+                    len(canonical_results),
+                )
 
                 st.dataframe(
                     results,
@@ -299,23 +458,66 @@ elif page == "rG4 sequence analysis":
                     hide_index=True,
                 )
 
-                if "candidate_type" in results.columns:
+                # G4Hunter score distribution only.
+                st.subheader("G4Hunter score distribution")
+
+                if not g4hunter_results.empty:
 
                     fig = px.histogram(
-                        results,
+                        g4hunter_results,
                         x="score",
-                        color="candidate_type",
-                        title="Distribution of candidate scores",
+                        nbins=15,
+                        title="G4Hunter sliding-window scores",
                         labels={
-                            "score": "G4Hunter-style mean score",
-                            "candidate_type": "Prediction method",
+                            "score": "Mean G4Hunter window score",
+                            "count": "Number of candidate regions",
                         },
-                        barmode="overlay",
                     )
 
                     st.plotly_chart(
                         fig,
                         use_container_width=True,
+                    )
+
+                else:
+
+                    st.info(
+                        "No G4Hunter sliding-window candidates "
+                        "were detected. Canonical motif results "
+                        "are shown separately below."
+                    )
+
+                # Canonical motif score display only.
+                st.subheader("Canonical motif results")
+
+                if not canonical_results.empty:
+
+                    st.dataframe(
+                        canonical_results[
+                            [
+                                "sequence_id",
+                                "start",
+                                "end",
+                                "candidate_sequence",
+                                "score",
+                                "score_type",
+                                "length",
+                            ]
+                        ],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                    st.caption(
+                        "Canonical motif scores are descriptive "
+                        "motif composition scores, not G4Hunter "
+                        "sliding-window scores."
+                    )
+
+                else:
+
+                    st.info(
+                        "No canonical four-tract motifs were detected."
                     )
 
                 st.download_button(
@@ -326,10 +528,10 @@ elif page == "rG4 sequence analysis":
                 )
 
         st.info(
-            "Important: Computational candidates are predictions, "
+            "Computational predictions identify candidate regions, "
             "not experimentally confirmed RNA G-quadruplex structures. "
-            "G4Hunter-style scoring and canonical motif screening "
-            "are separate approaches."
+            "Overlapping candidates are not necessarily independent "
+            "folded structures."
         )
 
 
@@ -461,6 +663,12 @@ elif page == "Integrated rG4–APA analysis":
             try:
                 mapping = read_tabular(mapping_file)
 
+                st.caption(
+                    "Mapping coordinates must be 0-based, "
+                    "half-open genomic intervals, using the same "
+                    "genome assembly as the APA annotations."
+                )
+
                 if st.button("Run integrated analysis"):
 
                     integrated = integrate_rg4_apa(
@@ -507,7 +715,7 @@ elif page == "Integrated rG4–APA analysis":
                 )
 
                 c2.metric(
-                    "Regions overlapping APA annotations",
+                    "Candidate intervals overlapping APA",
                     overlap_count,
                 )
 
@@ -524,10 +732,40 @@ elif page == "Integrated rG4–APA analysis":
                     mime="text/csv",
                 )
 
-        st.caption(
-            "Genomic overlap does not establish causal regulation. "
-            "Use compatible genome assemblies, strand information "
-            "and coordinate conventions."
+                st.divider()
+                st.subheader("Genomic coordinate visualization")
+
+                chromosomes = sorted(
+                    integrated["chrom"].astype(str).unique()
+                )
+
+                selected_chromosome = st.selectbox(
+                    "Select chromosome",
+                    chromosomes,
+                    key="genomic_chromosome",
+                )
+
+                figure = create_genomic_figure(
+                    integrated,
+                    apa,
+                    selected_chromosome,
+                )
+
+                st.plotly_chart(
+                    figure,
+                    use_container_width=True,
+                )
+
+                st.caption(
+                    "Horizontal segments represent mapped candidate "
+                    "intervals. Diamond markers represent APA "
+                    "annotation positions. Hover over features for "
+                    "their coordinates and annotation details."
+                )
+
+        st.info(
+            "Genomic overlap is a positional relationship. It does "
+            "not establish that an rG4 structure causes APA regulation."
         )
 
 
@@ -550,6 +788,7 @@ elif page == "Results & report":
         apa = pd.DataFrame()
 
     if integrated is not None:
+
         st.metric(
             "Integrated candidate regions",
             len(integrated),
@@ -558,7 +797,7 @@ elif page == "Results & report":
     c1, c2 = st.columns(2)
 
     c1.metric(
-        "rG4 candidate regions",
+        "rG4 candidate intervals",
         len(rg4),
     )
 
@@ -581,5 +820,4 @@ elif page == "Results & report":
     )
 
     st.markdown("### Report preview")
-
     st.markdown(report)
