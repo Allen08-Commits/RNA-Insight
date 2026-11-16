@@ -1,16 +1,11 @@
 
-"""APA annotation utilities with PolyA_DB v4.1 retrieval.
-
-Supports tabular files and SQLite databases inside the official ZIP archive.
-Human coordinates are reported on hg38.
-"""
+"""RNA-Insight APA utilities for PolyA_DB v4.1 human hg38 data."""
 
 from __future__ import annotations
 
 from io import BytesIO
 from zipfile import ZipFile
 import re
-import sqlite3
 
 import pandas as pd
 import requests
@@ -23,16 +18,16 @@ POLYA_DB_URL = (
 
 POLYA_DB_ASSEMBLY = "hg38"
 
-REQUIRED_APA_COLUMNS = {
-    "sequence_id", "chrom", "start", "end", "strand"
-}
-
 GENE_SYMBOLS = [
     "HSPA1A", "HSP90AA1", "DDIT3", "ATF4"
 ]
 
+REQUIRED_APA_COLUMNS = {
+    "sequence_id", "chrom", "start", "end", "strand"
+}
 
-def _clean_column_name(value: str) -> str:
+
+def _clean_column_name(value):
     return (
         str(value).strip().lower()
         .replace("-", "_")
@@ -41,64 +36,10 @@ def _clean_column_name(value: str) -> str:
     )
 
 
-def _read_sqlite_database(content: bytes) -> tuple[list[pd.DataFrame], list[str]]:
-    """Read every user table from an SQLite database."""
+def _read_database_archive(content):
+    """Read tabular files from the PolyA_DB ZIP archive."""
     frames = []
-    descriptions = []
-
-    connection = sqlite3.connect(":memory:")
-
-    try:
-        connection.deserialize(content)
-
-        tables = pd.read_sql_query(
-            """
-            SELECT name
-            FROM sqlite_master
-            WHERE type = 'table'
-            AND name NOT LIKE 'sqlite_%'
-            """,
-            connection,
-        )
-
-        for table_name in tables["name"].tolist():
-            safe_name = str(table_name).replace('"', '""')
-
-            try:
-                frame = pd.read_sql_query(
-                    f'SELECT * FROM "{safe_name}"',
-                    connection,
-                )
-
-                if not frame.empty:
-                    frame.columns = [
-                        _clean_column_name(c)
-                        for c in frame.columns
-                    ]
-                    frames.append(frame)
-                    descriptions.append(
-                        f"SQLite table: {table_name}, "
-                        f"rows: {len(frame)}, "
-                        f"columns: {', '.join(frame.columns)}"
-                    )
-
-            except Exception as exc:
-                descriptions.append(
-                    f"Could not read SQLite table {table_name}: {exc}"
-                )
-
-    finally:
-        connection.close()
-
-    return frames, descriptions
-
-
-def _read_database_archive(
-    content: bytes,
-) -> tuple[list[pd.DataFrame], list[str]]:
-    """Read supported files from the downloaded ZIP archive."""
-    frames = []
-    descriptions = []
+    diagnostics = []
 
     with ZipFile(BytesIO(content)) as archive:
         files = [
@@ -107,150 +48,126 @@ def _read_database_archive(
             and not name.startswith("__MACOSX/")
         ]
 
-        descriptions.append(
-            "Archive files: " + ", ".join(files[:40])
-        )
+        diagnostics.extend(files)
 
-        for filename in files:
-            lower_name = filename.lower()
+        # Prefer the Main collection, which has long-read support.
+        preferred = [
+            name for name in files
+            if name.lower().endswith(
+                "hg38.pas.main.tsv"
+            )
+        ]
 
-            try:
-                raw = archive.read(filename)
+        if not preferred:
+            preferred = [
+                name for name in files
+                if name.lower().endswith(".tsv")
+            ]
 
-                if lower_name.endswith(
-                    (".sqlite", ".sqlite3", ".db")
-                ):
-                    sqlite_frames, sqlite_info = (
-                        _read_sqlite_database(raw)
-                    )
-                    frames.extend(sqlite_frames)
-                    descriptions.extend(sqlite_info)
-                    continue
-
-                if lower_name.endswith(
-                    (".tsv", ".txt", ".bed", ".gz")
-                ):
-                    compression = (
-                        "gzip" if lower_name.endswith(".gz") else None
-                    )
-
-                    frame = pd.read_csv(
-                        BytesIO(raw),
-                        sep="\t",
-                        comment="#",
-                        low_memory=False,
-                        compression=compression,
-                    )
-
-                elif lower_name.endswith(".csv"):
-                    frame = pd.read_csv(
-                        BytesIO(raw),
-                        low_memory=False,
-                    )
-
-                else:
-                    continue
-
-                if not frame.empty:
-                    frame.columns = [
-                        _clean_column_name(c)
-                        for c in frame.columns
-                    ]
-                    frames.append(frame)
-                    descriptions.append(
-                        f"{filename}: {len(frame)} rows; "
-                        f"columns: {', '.join(frame.columns)}"
-                    )
-
-            except Exception as exc:
-                descriptions.append(
-                    f"Could not parse {filename}: {exc}"
+        for filename in preferred:
+            with archive.open(filename) as file:
+                frame = pd.read_csv(
+                    file,
+                    sep="\t",
+                    low_memory=False,
+                    dtype=str,
                 )
 
-    return frames, descriptions
+            frame.columns = [
+                _clean_column_name(c)
+                for c in frame.columns
+            ]
+
+            frames.append(frame)
+
+    return frames, diagnostics
 
 
-def _find_column(
-    frame: pd.DataFrame,
-    aliases: list[str],
-):
-    for name in aliases:
-        if name in frame.columns:
-            return name
+def _parse_pas_id(value):
+    """Extract chromosome, 1-based position and strand from PAS_ID.
+
+    The parser accepts common chromosome:position:strand,
+    chromosome_position_strand and chromosome-position-strand forms.
+    """
+
+    value = str(value).strip()
+
+    patterns = [
+        r"^(chr(?:[0-9]+|X|Y|M|MT))[:_|\-](\d+)[:_|\-]([+-])$",
+        r"^(?:.*?)(chr(?:[0-9]+|X|Y|M|MT))[:_|\-](\d+)[:_|\-]([+-])$",
+    ]
+
+    for pattern in patterns:
+        match = re.search(
+            pattern,
+            value,
+            flags=re.IGNORECASE,
+        )
+
+        if match:
+            chrom = match.group(1)
+            position = int(match.group(2))
+            strand = match.group(3)
+
+            if position > 0:
+                return chrom, position, strand
+
     return None
 
 
-def _extract_gene_annotations(
-    frames: list[pd.DataFrame],
-    gene_symbols: list[str],
-) -> pd.DataFrame:
-    """Identify gene-associated PAS records and standardize coordinates."""
+def _extract_gene_annotations(frames, gene_symbols):
+    """Extract requested genes and decode their PAS identifiers."""
 
     gene_aliases = [
-        "gene_symbol", "genesymbol", "gene_name",
-        "symbol", "gene", "refseq_gene_symbol",
+        "genesymbol",
+        "gene_symbol",
+        "gene_name",
+        "symbol",
     ]
 
-    chromosome_aliases = [
-        "chrom", "chr", "chromosome",
-        "chromosome_name", "seqname",
-    ]
-
-    start_aliases = [
-        "start", "genomic_start", "position_start",
-        "pas_start", "cleavage_start",
-    ]
-
-    end_aliases = [
-        "end", "genomic_end", "position_end",
-        "pas_end", "cleavage_end",
-    ]
-
-    position_aliases = [
-        "position", "pas_position", "cleavage_site",
-        "cs", "representative_position",
-        "last_aligned_position",
-    ]
-
-    strand_aliases = [
-        "strand", "orientation",
+    pas_id_aliases = [
+        "pas_id",
+        "site_id",
     ]
 
     type_aliases = [
-        "pas_type", "site_type", "type",
-        "annotation", "refseq_type",
-    ]
-
-    id_aliases = [
-        "pas_id", "site_id", "id",
+        "pas_type_refseq_label",
+        "pas_lrtype_label",
+        "pas_type",
+        "site_type",
     ]
 
     requested = {
-        str(symbol).strip().upper()
-        for symbol in gene_symbols
+        str(g).strip().upper()
+        for g in gene_symbols
     }
 
     extracted = []
 
     for frame in frames:
-        gene_col = _find_column(frame, gene_aliases)
-        chrom_col = _find_column(frame, chromosome_aliases)
-        strand_col = _find_column(frame, strand_aliases)
+        gene_col = next(
+            (c for c in gene_aliases if c in frame.columns),
+            None,
+        )
 
-        start_col = _find_column(frame, start_aliases)
-        end_col = _find_column(frame, end_aliases)
-        position_col = _find_column(frame, position_aliases)
+        pas_id_col = next(
+            (c for c in pas_id_aliases if c in frame.columns),
+            None,
+        )
 
-        if not all([gene_col, chrom_col, strand_col]):
-            continue
+        type_col = next(
+            (c for c in type_aliases if c in frame.columns),
+            None,
+        )
 
-        if not start_col and not position_col:
+        if not gene_col or not pas_id_col:
             continue
 
         working = frame.copy()
 
         working["_gene"] = (
             working[gene_col]
+            .fillna("")
             .astype(str)
             .str.strip()
             .str.upper()
@@ -263,130 +180,148 @@ def _extract_gene_annotations(
         if working.empty:
             continue
 
-        if start_col and end_col:
-            working["_start"] = pd.to_numeric(
-                working[start_col], errors="coerce"
-            )
-            working["_end"] = pd.to_numeric(
-                working[end_col], errors="coerce"
-            )
+        parsed = working[pas_id_col].apply(_parse_pas_id)
 
-        elif position_col:
-            working["_start"] = pd.to_numeric(
-                working[position_col], errors="coerce"
-            )
-            working["_end"] = working["_start"] + 1
+        working["_parsed"] = parsed
 
-        else:
+        working = working[
+            working["_parsed"].notna()
+        ].copy()
+
+        if working.empty:
             continue
 
-        type_col = _find_column(working, type_aliases)
-        id_col = _find_column(working, id_aliases)
+        working["chrom"] = working["_parsed"].apply(
+            lambda x: x[0]
+        )
+
+        working["_position"] = working["_parsed"].apply(
+            lambda x: x[1]
+        )
+
+        working["strand"] = working["_parsed"].apply(
+            lambda x: x[2]
+        )
+
+        # Convert 1-based cleavage position to BED coordinates.
+        working["start"] = working["_position"] - 1
+        working["end"] = working["_position"]
+
+        if type_col:
+            working["site_type"] = (
+                working[type_col]
+                .fillna("unspecified")
+                .astype(str)
+                .str.lower()
+            )
+        else:
+            working["site_type"] = "unspecified"
 
         result = pd.DataFrame({
             "sequence_id": working["_gene"],
             "gene_symbol": working["_gene"],
-            "chrom": working[chrom_col].astype(str),
-            "start": working["_start"],
-            "end": working["_end"],
-            "strand": working[strand_col].astype(str),
-            "site_type": (
-                working[type_col].astype(str)
-                if type_col
-                else "unspecified"
-            ),
+            "pas_id": working[pas_id_col].astype(str),
+            "chrom": working["chrom"],
+            "start": working["start"],
+            "end": working["end"],
+            "strand": working["strand"],
+            "site_type": working["site_type"],
             "assembly": POLYA_DB_ASSEMBLY,
             "source": "PolyA_DB_v4.1",
         })
 
-        if id_col:
-            result["pas_id"] = working[id_col].astype(str)
+        # Preserve useful annotation fields when available.
+        for column in [
+            "pas_type_refseq_label",
+            "pas_lrtype_label",
+            "pas2gene",
+            "pas2gene_refseq",
+            "pse_3reads",
+            "avgrpm_3reads",
+            "polya_strength",
+            "polya_strength_percentile",
+            "conservation",
+        ]:
+            if column in working.columns:
+                result[column] = working[column].values
 
         extracted.append(result)
 
     if not extracted:
         raise ValueError(
-            "No compatible gene-associated PAS table was identified. "
-            "The archive was inspected, but its table columns did not "
-            "match the supported gene, chromosome, position and strand "
-            "fields. Check the archive diagnostics."
+            "No APA records could be extracted. "
+            "The PAS identifier format may differ from the "
+            "supported chromosome-position-strand format."
         )
 
-    return pd.concat(extracted, ignore_index=True)
+    return pd.concat(
+        extracted,
+        ignore_index=True,
+    )
 
 
 def fetch_apa_sites(
-    gene_symbols: list[str] | None = None,
-    timeout: int = 90,
-) -> pd.DataFrame:
-    """Download PolyA_DB v4.1 human annotations and filter genes."""
+    gene_symbols=None,
+    timeout=90,
+):
+    """Retrieve human APA annotations from PolyA_DB v4.1."""
 
     if gene_symbols is None:
         gene_symbols = GENE_SYMBOLS
 
     gene_symbols = [
-        str(symbol).strip().upper()
-        for symbol in gene_symbols
-        if str(symbol).strip()
+        str(g).strip().upper()
+        for g in gene_symbols
+        if str(g).strip()
     ]
 
     if not gene_symbols:
-        raise ValueError("Provide at least one gene symbol.")
+        raise ValueError(
+            "Provide at least one gene symbol."
+        )
 
     try:
         response = requests.get(
             POLYA_DB_URL,
             timeout=timeout,
-            headers={"User-Agent": "RNA-Insight/1.0"},
+            headers={
+                "User-Agent": "RNA-Insight/1.0"
+            },
         )
+
         response.raise_for_status()
 
     except requests.RequestException as exc:
         raise RuntimeError(
-            f"Could not download PolyA_DB annotations: {exc}"
+            f"PolyA_DB download failed: {exc}"
         ) from exc
 
     if not response.content.startswith(b"PK"):
         raise RuntimeError(
-            "The PolyA_DB download did not return a ZIP archive. "
-            "Check whether the official download service is available."
+            "The downloaded file is not a valid ZIP archive."
         )
 
-    try:
-        frames, diagnostics = _read_database_archive(
-            response.content
-        )
-
-    except Exception as exc:
-        raise RuntimeError(
-            f"Could not inspect the PolyA_DB ZIP archive: {exc}"
-        ) from exc
+    frames, archive_files = _read_database_archive(
+        response.content
+    )
 
     if not frames:
-        details = "\n".join(diagnostics[:25])
         raise RuntimeError(
-            "No readable annotation tables were found in the archive.\n"
-            + details
+            "No compatible TSV files were found. "
+            f"Archive contents: {archive_files}"
         )
 
-    try:
-        result = _extract_gene_annotations(
-            frames,
-            gene_symbols,
-        )
-
-    except ValueError as exc:
-        details = "\n".join(diagnostics[:25])
-        raise ValueError(
-            f"{exc}\n\nArchive inspection details:\n{details}"
-        ) from exc
+    result = _extract_gene_annotations(
+        frames,
+        gene_symbols,
+    )
 
     result = standardize_apa_sites(result)
 
     result = result.drop_duplicates(
         subset=[
-            "gene_symbol", "chrom",
-            "start", "end", "strand",
+            "gene_symbol",
+            "pas_id",
         ]
     ).reset_index(drop=True)
 
@@ -397,36 +332,38 @@ def fetch_apa_sites(
     return result
 
 
-def standardize_apa_sites(
-    frame: pd.DataFrame,
-) -> pd.DataFrame:
-    """Validate and standardize an APA annotation table."""
+def standardize_apa_sites(frame):
+    """Validate APA annotations."""
 
     result = frame.copy()
 
     result.columns = [
-        _clean_column_name(column)
-        for column in result.columns
+        _clean_column_name(c)
+        for c in result.columns
     ]
 
     missing = REQUIRED_APA_COLUMNS - set(result.columns)
 
     if missing:
         raise ValueError(
-            "APA table is missing required columns: "
+            "Missing required APA columns: "
             + ", ".join(sorted(missing))
         )
 
     result["sequence_id"] = (
         result["sequence_id"].astype(str)
     )
+
     result["chrom"] = result["chrom"].astype(str)
 
     result["start"] = pd.to_numeric(
-        result["start"], errors="raise"
+        result["start"],
+        errors="raise",
     )
+
     result["end"] = pd.to_numeric(
-        result["end"], errors="raise"
+        result["end"],
+        errors="raise",
     )
 
     result["strand"] = (
@@ -443,7 +380,9 @@ def standardize_apa_sites(
             "APA end must be greater than start."
         )
 
-    if not result["strand"].isin(["+", "-", "."]).all():
+    if not result["strand"].isin(
+        ["+", "-", "."]
+    ).all():
         raise ValueError(
             "Strand values must be +, - or ."
         )
@@ -461,10 +400,8 @@ def standardize_apa_sites(
     return result
 
 
-def summarize_apa_sites(
-    frame: pd.DataFrame,
-) -> dict:
-    """Summarize annotated APA site counts."""
+def summarize_apa_sites(frame):
+    """Summarize annotated APA sites."""
 
     if frame.empty:
         return {
@@ -480,11 +417,13 @@ def summarize_apa_sites(
     )
 
     proximal = site_types.str.contains(
-        "proximal", na=False
+        "proximal",
+        na=False,
     ).sum()
 
     distal = site_types.str.contains(
-        "distal", na=False
+        "distal",
+        na=False,
     ).sum()
 
     return {
