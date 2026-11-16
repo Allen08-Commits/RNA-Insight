@@ -1,41 +1,19 @@
 
-"""Retrieve real human gene and transcript data from Ensembl REST.
-
-Data retrieved:
-- Ensembl gene identifiers
-- Gene names and biotypes
-- Transcript identifiers
-- Transcript sequences (cDNA)
-- Chromosome, genomic coordinates, strand and assembly
-
-Important:
-Transcript cDNA coordinates are not interchangeable with genomic
-coordinates because mature transcripts can contain spliced exons.
-This module does not create a false one-interval transcript mapping.
-"""
+"""Human gene and transcript retrieval using the Ensembl REST API."""
 
 from __future__ import annotations
 
-import re
+import json
 import time
-from typing import Any
+import urllib.error
+import urllib.parse
+import urllib.request
 
 import pandas as pd
-import requests
 
 
-ENSEMBL_BASE = "https://rest.ensembl.org"
-
-HEADERS_JSON = {
-    "Accept": "application/json",
-    "Content-Type": "application/json",
-    "User-Agent": "RNA-Insight/1.0 research application",
-}
-
-HEADERS_FASTA = {
-    "Accept": "text/x-fasta",
-    "User-Agent": "RNA-Insight/1.0 research application",
-}
+BASE_URL = "https://rest.ensembl.org"
+SPECIES = "homo_sapiens"
 
 DEFAULT_GENES = [
     "HSPA1A",
@@ -44,372 +22,479 @@ DEFAULT_GENES = [
     "ATF4",
 ]
 
-GENE_COLUMNS = [
-    "gene_symbol",
-    "gene_id",
-    "gene_name",
-    "biotype",
-    "chromosome",
-    "genomic_start",
-    "genomic_end",
-    "strand",
-    "assembly",
-]
-
-TRANSCRIPT_COLUMNS = [
-    "gene_symbol",
-    "gene_id",
-    "transcript_id",
-    "transcript_name",
-    "biotype",
-    "is_canonical",
-    "chromosome",
-    "genomic_start",
-    "genomic_end",
-    "strand",
-    "assembly",
-    "sequence_length",
-    "sequence_status",
-]
+HEADERS = {
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+    "User-Agent": "RNA-Insight/1.0 research application",
+}
 
 
-class EnsemblError(RuntimeError):
-    """Raised when Ensembl data cannot be retrieved or validated."""
+class EnsemblError(Exception):
+    """Raised when Ensembl retrieval or gene resolution fails."""
 
 
-def _get_json(
-    endpoint: str,
-    params: dict[str, Any] | None = None,
-) -> Any:
-    """Request a JSON response from Ensembl."""
-    url = f"{ENSEMBL_BASE}{endpoint}"
+def _request_json(endpoint: str, retries: int = 3):
+    """Request JSON from Ensembl with basic retry handling."""
 
-    try:
-        response = requests.get(
+    url = BASE_URL + endpoint
+
+    for attempt in range(retries):
+        request = urllib.request.Request(
             url,
-            headers=HEADERS_JSON,
-            params=params,
-            timeout=30,
+            headers=HEADERS,
+            method="GET",
         )
 
-        if response.status_code == 429:
-            time.sleep(2)
-            response = requests.get(
-                url,
-                headers=HEADERS_JSON,
-                params=params,
-                timeout=30,
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=35,
+            ) as response:
+                return json.loads(
+                    response.read().decode("utf-8")
+                )
+
+        except urllib.error.HTTPError as exc:
+
+            if exc.code in (429, 500, 502, 503, 504):
+                if attempt < retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+
+            detail = exc.read().decode(
+                "utf-8",
+                errors="replace",
             )
 
-        response.raise_for_status()
-        return response.json()
+            raise EnsemblError(
+                f"Ensembl returned HTTP {exc.code}: {detail[:300]}"
+            ) from exc
 
-    except requests.RequestException as exc:
-        raise EnsemblError(
-            f"Ensembl request failed for {endpoint}: {exc}"
-        ) from exc
+        except urllib.error.URLError as exc:
 
-    except ValueError as exc:
-        raise EnsemblError(
-            f"Ensembl returned invalid JSON for {endpoint}."
-        ) from exc
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+                continue
 
+            raise EnsemblError(
+                f"Could not connect to Ensembl: {exc}"
+            ) from exc
 
-def _get_sequence(transcript_id: str) -> str:
-    """Retrieve a transcript cDNA sequence in FASTA format."""
-    url = f"{ENSEMBL_BASE}/sequence/id/{transcript_id}"
+        except json.JSONDecodeError as exc:
+            raise EnsemblError(
+                "Ensembl returned an invalid JSON response."
+            ) from exc
 
-    try:
-        response = requests.get(
-            url,
-            headers=HEADERS_FASTA,
-            params={"type": "cdna"},
-            timeout=45,
-        )
-        response.raise_for_status()
-
-    except requests.RequestException as exc:
-        raise EnsemblError(
-            f"Could not retrieve transcript {transcript_id}: {exc}"
-        ) from exc
-
-    lines = response.text.strip().splitlines()
-
-    if not lines or not lines[0].startswith(">"):
-        raise EnsemblError(
-            f"Unexpected FASTA response for {transcript_id}."
-        )
-
-    sequence = "".join(
-        line.strip()
-        for line in lines[1:]
-        if line.strip()
-    ).upper()
-
-    if not sequence:
-        raise EnsemblError(
-            f"Empty cDNA sequence returned for {transcript_id}."
-        )
-
-    allowed = set("ACGTUNRYKMSWBDHV")
-
-    if set(sequence) - allowed:
-        raise EnsemblError(
-            f"Unexpected nucleotide characters in {transcript_id}."
-        )
-
-    return sequence.replace("T", "U")
+    raise EnsemblError("Ensembl request failed after retries.")
 
 
-def _find_gene(gene_symbol: str) -> dict[str, Any]:
-    """Resolve a human gene symbol to an Ensembl gene record."""
-    symbol = gene_symbol.strip().upper()
+def _request_sequence(transcript_id: str) -> str:
+    """Retrieve transcript cDNA and normalize it to RNA."""
 
-    if not re.fullmatch(r"[A-Z0-9_.-]+", symbol):
-        raise ValueError(
-            f"Invalid gene symbol: {gene_symbol}"
-        )
-
-    matches = _get_json(
-        f"/xrefs/symbol/homo_sapiens/{symbol}"
+    endpoint = (
+        f"/sequence/id/{urllib.parse.quote(transcript_id)}"
+        "?type=cdna"
     )
 
-    gene_matches = [
-        item
-        for item in matches
+    url = BASE_URL + endpoint
+
+    headers = {
+        "Accept": "text/plain",
+        "User-Agent": HEADERS["User-Agent"],
+    }
+
+    request = urllib.request.Request(
+        url,
+        headers=headers,
+        method="GET",
+    )
+
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=35,
+            ) as response:
+                sequence = response.read().decode("utf-8")
+
+            sequence = "".join(
+                sequence.split()
+            ).upper()
+
+            if sequence.startswith(">"):
+                sequence = "".join(
+                    sequence.splitlines()[1:]
+                ).upper()
+
+            sequence = sequence.replace("T", "U")
+
+            if not sequence:
+                raise EnsemblError(
+                    f"Empty cDNA sequence for {transcript_id}."
+                )
+
+            return sequence
+
+        except urllib.error.HTTPError as exc:
+
+            if exc.code in (429, 500, 502, 503, 504):
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                    continue
+
+            raise EnsemblError(
+                f"Sequence retrieval failed for "
+                f"{transcript_id}: HTTP {exc.code}"
+            ) from exc
+
+        except urllib.error.URLError as exc:
+
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+
+            raise EnsemblError(
+                f"Could not retrieve sequence for "
+                f"{transcript_id}: {exc}"
+            ) from exc
+
+    raise EnsemblError(
+        f"Sequence retrieval failed for {transcript_id}."
+    )
+
+
+def _lookup_gene(gene_id: str) -> dict:
+    """Retrieve expanded gene annotation."""
+
+    endpoint = (
+        f"/lookup/id/{urllib.parse.quote(gene_id)}"
+        "?expand=1"
+    )
+
+    result = _request_json(endpoint)
+
+    if not isinstance(result, dict):
+        raise EnsemblError(
+            f"Unexpected lookup response for {gene_id}."
+        )
+
+    if result.get("object_type") != "Gene":
+        raise EnsemblError(
+            f"{gene_id} is not an Ensembl gene record."
+        )
+
+    return result
+
+
+def _find_gene(symbol: str) -> tuple[str, dict]:
+    """
+    Resolve a gene symbol to one exact Ensembl gene.
+
+    Exact external_name matches are preferred.
+    Protein-coding records are preferred over pseudogenes
+    or other biotypes. If multiple equally suitable records
+    remain, the function reports ambiguity instead of
+    silently selecting an arbitrary gene.
+    """
+
+    encoded_symbol = urllib.parse.quote(symbol)
+
+    endpoint = (
+        f"/xrefs/symbol/{SPECIES}/{encoded_symbol}"
+        "?object_type=gene"
+    )
+
+    xrefs = _request_json(endpoint)
+
+    if not isinstance(xrefs, list):
+        raise EnsemblError(
+            f"Unexpected xref response for {symbol}."
+        )
+
+    gene_ids = sorted({
+        item.get("id")
+        for item in xrefs
         if item.get("type") == "gene"
         and item.get("id")
-    ]
-
-    if not gene_matches:
-        raise EnsemblError(
-            f"No Ensembl gene record found for {symbol}."
-        )
-
-    # Prefer an exact display-name match when multiple xrefs exist.
-    exact_matches = [
-        item
-        for item in gene_matches
-        if str(item.get("display_id", "")).upper() == symbol
-    ]
-
-    selected = exact_matches or gene_matches
-
-    unique_ids = sorted({
-        item["id"] for item in selected
     })
 
-    if len(unique_ids) > 1:
+    if not gene_ids:
         raise EnsemblError(
-            f"Multiple Ensembl gene records found for {symbol}: "
-            + ", ".join(unique_ids)
-            + ". Resolve the gene identifier before proceeding."
+            f"No Ensembl gene records found for {symbol}."
         )
 
-    gene_id = unique_ids[0]
+    candidates = []
 
-    gene_data = _get_json(
-        f"/lookup/id/{gene_id}",
-        params={"expand": 1},
-    )
+    for gene_id in gene_ids:
+        try:
+            details = _lookup_gene(gene_id)
 
-    if gene_data.get("object_type") != "Gene":
+            external_name = str(
+                details.get("external_name", "")
+            ).upper()
+
+            if external_name != symbol.upper():
+                continue
+
+            candidates.append(
+                (gene_id, details)
+            )
+
+        except EnsemblError:
+            continue
+
+    if not candidates:
         raise EnsemblError(
-            f"Resolved identifier {gene_id} is not a gene."
+            f"No exact gene-symbol match found for {symbol}. "
+            f"Candidate Ensembl IDs: {', '.join(gene_ids)}"
         )
 
-    return gene_data
+    # Prefer protein-coding genes.
+    protein_coding = [
+        item
+        for item in candidates
+        if item[1].get("biotype") == "protein_coding"
+    ]
+
+    if protein_coding:
+        candidates = protein_coding
+
+    # Prefer records with a canonical transcript annotation.
+    canonical = [
+        item
+        for item in candidates
+        if item[1].get("canonical_transcript")
+    ]
+
+    if len(canonical) == 1:
+        candidates = canonical
+
+    if len(candidates) > 1:
+        candidate_summary = "; ".join(
+            f"{gene_id} "
+            f"(biotype={details.get('biotype')}, "
+            f"assembly={details.get('assembly_name', 'unknown')})"
+            for gene_id, details in candidates
+        )
+
+        raise EnsemblError(
+            f"Multiple equally suitable Ensembl records remain "
+            f"for {symbol}: {candidate_summary}. "
+            "Please resolve the gene ID using an authoritative "
+            "gene annotation source before analysis."
+        )
+
+    return candidates[0]
 
 
 def fetch_human_gene(
-    gene_symbol: str,
-    max_transcripts: int = 20,
-) -> dict[str, Any]:
-    """
-    Retrieve one human gene and its transcript cDNA sequences.
+    symbol: str,
+    max_transcripts: int = 5,
+) -> dict:
+    """Retrieve one human gene, its transcripts and cDNA sequences."""
 
-    The canonical transcript is prioritized. Other transcripts
-    are retrieved up to max_transcripts.
+    symbol = symbol.strip().upper()
 
-    Returns a dictionary containing:
-        gene: gene annotation dictionary
-        transcripts: transcript metadata DataFrame
-        fasta: multi-record RNA FASTA string
-    """
-    if max_transcripts < 1:
-        raise ValueError(
-            "max_transcripts must be at least 1."
-        )
+    if not symbol:
+        raise EnsemblError("Gene symbol cannot be empty.")
 
-    gene = _find_gene(gene_symbol)
+    gene_id, gene = _find_gene(symbol)
+
+    canonical_id = gene.get("canonical_transcript")
 
     transcript_records = gene.get("Transcript", [])
 
-    if not transcript_records:
-        raise EnsemblError(
-            f"No transcripts found for {gene_symbol}."
+    if not isinstance(transcript_records, list):
+        transcript_records = []
+
+    # Rank canonical and protein-coding transcripts first.
+    def transcript_rank(transcript: dict):
+        transcript_id = transcript.get("id", "")
+
+        is_canonical = (
+            transcript_id == canonical_id
+            or transcript_id.split(".")[0]
+            == str(canonical_id).split(".")[0]
+        )
+
+        is_protein_coding = (
+            transcript.get("biotype") == "protein_coding"
+        )
+
+        return (
+            not is_canonical,
+            not is_protein_coding,
+            transcript_id,
         )
 
     transcript_records = sorted(
         transcript_records,
-        key=lambda item: (
-            not bool(item.get("is_canonical", 0)),
-            item.get("id", ""),
-        ),
+        key=transcript_rank,
     )
 
-    transcript_records = transcript_records[:max_transcripts]
+    transcript_records = transcript_records[
+        :max_transcripts
+    ]
 
-    gene_id = gene["id"]
-    resolved_symbol = (
-        gene.get("display_name")
-        or gene_symbol.upper()
-    )
+    gene_record = {
+        "gene_symbol": symbol,
+        "gene_id": gene_id,
+        "gene_name": gene.get("description", ""),
+        "biotype": gene.get("biotype", ""),
+        "chromosome": gene.get("seq_region_name", ""),
+        "genomic_start": gene.get("start"),
+        "genomic_end": gene.get("end"),
+        "strand": gene.get("strand"),
+        "assembly": gene.get("assembly_name", ""),
+    }
 
     transcript_rows = []
     fasta_records = []
 
-    for index, transcript in enumerate(transcript_records):
+    for transcript in transcript_records:
 
         transcript_id = transcript.get("id")
 
         if not transcript_id:
             continue
 
-        # Avoid rapid bursts of requests.
-        if index:
-            time.sleep(0.12)
+        is_canonical = (
+            transcript_id == canonical_id
+            or transcript_id.split(".")[0]
+            == str(canonical_id).split(".")[0]
+        )
 
-        sequence_status = "retrieved"
-        sequence = ""
-
-        try:
-            sequence = _get_sequence(transcript_id)
-
-        except EnsemblError:
-            sequence_status = "sequence_retrieval_failed"
-
-        transcript_rows.append({
-            "gene_symbol": resolved_symbol,
+        row = {
+            "gene_symbol": symbol,
             "gene_id": gene_id,
             "transcript_id": transcript_id,
             "transcript_name": transcript.get(
-                "display_name",
-                transcript_id,
+                "display_name", ""
             ),
-            "biotype": transcript.get("biotype", "unknown"),
-            "is_canonical": bool(
-                transcript.get("is_canonical", 0)
-            ),
-            "chromosome": str(
-                transcript.get("seq_region_name", "")
+            "biotype": transcript.get("biotype", ""),
+            "is_canonical": is_canonical,
+            "chromosome": transcript.get(
+                "seq_region_name",
+                gene.get("seq_region_name", ""),
             ),
             "genomic_start": transcript.get("start"),
             "genomic_end": transcript.get("end"),
-            "strand": transcript.get("strand"),
-            "assembly": transcript.get(
-                "assembly_name",
-                gene.get("assembly_name", "unknown"),
+            "strand": transcript.get(
+                "strand",
+                gene.get("strand"),
             ),
-            "sequence_length": len(sequence),
-            "sequence_status": sequence_status,
-        })
+            "assembly": gene.get("assembly_name", ""),
+            "sequence_status": "pending",
+            "sequence_length": 0,
+        }
 
-        if sequence:
+        try:
+            sequence = _request_sequence(transcript_id)
+
+            row["sequence_status"] = "retrieved"
+            row["sequence_length"] = len(sequence)
+
             fasta_records.append(
-                f">{transcript_id}|{resolved_symbol}|"
-                f"gene_id={gene_id}|"
-                f"assembly={transcript.get('assembly_name', 'unknown')}\n"
-                f"{sequence}"
+                f">{symbol}|{gene_id}|{transcript_id}\n"
+                f"{sequence}\n"
             )
 
-    transcript_df = pd.DataFrame(
-        transcript_rows,
-        columns=TRANSCRIPT_COLUMNS,
-    )
+        except EnsemblError as exc:
+            row["sequence_status"] = (
+                f"failed: {str(exc)[:180]}"
+            )
 
-    if transcript_df.empty:
-        raise EnsemblError(
-            f"No transcript records could be processed for "
-            f"{gene_symbol}."
-        )
-
-    gene_record = {
-        "gene_symbol": resolved_symbol,
-        "gene_id": gene_id,
-        "gene_name": gene.get("description", ""),
-        "biotype": gene.get("biotype", "unknown"),
-        "chromosome": str(gene.get("seq_region_name", "")),
-        "genomic_start": gene.get("start"),
-        "genomic_end": gene.get("end"),
-        "strand": gene.get("strand"),
-        "assembly": gene.get("assembly_name", "unknown"),
-    }
+        transcript_rows.append(row)
 
     return {
         "gene": gene_record,
-        "transcripts": transcript_df,
-        "fasta": "\n".join(fasta_records),
+        "transcripts": transcript_rows,
+        "fasta": "".join(fasta_records),
     }
 
 
 def fetch_gene_panel(
-    gene_symbols: list[str] | None = None,
-    max_transcripts_per_gene: int = 20,
-) -> dict[str, Any]:
-    """
-    Retrieve a panel of human genes.
+    gene_symbols: list[str],
+    max_transcripts_per_gene: int = 5,
+) -> dict:
+    """Retrieve a panel of human genes without stopping on one failure."""
 
-    A failure for one gene is recorded without stopping the
-    retrieval of the remaining genes.
-    """
-    symbols = gene_symbols or DEFAULT_GENES
-
-    gene_rows = []
-    transcript_frames = []
-    fasta_records = []
+    genes = []
+    transcripts = []
+    fasta_parts = []
     errors = []
 
-    for symbol in symbols:
+    normalized_symbols = [
+        str(symbol).strip().upper()
+        for symbol in gene_symbols
+        if str(symbol).strip()
+    ]
+
+    for symbol in normalized_symbols:
 
         try:
             result = fetch_human_gene(
-                symbol,
+                symbol=symbol,
                 max_transcripts=max_transcripts_per_gene,
             )
 
-            gene_rows.append(result["gene"])
-            transcript_frames.append(result["transcripts"])
+            genes.append(result["gene"])
+            transcripts.extend(result["transcripts"])
 
             if result["fasta"]:
-                fasta_records.append(result["fasta"])
+                fasta_parts.append(result["fasta"])
 
-        except (EnsemblError, ValueError) as exc:
+        except Exception as exc:
             errors.append({
                 "gene_symbol": symbol,
                 "error": str(exc),
             })
 
-    genes_df = pd.DataFrame(
-        gene_rows,
-        columns=GENE_COLUMNS,
-    )
+    gene_columns = [
+        "gene_symbol",
+        "gene_id",
+        "gene_name",
+        "biotype",
+        "chromosome",
+        "genomic_start",
+        "genomic_end",
+        "strand",
+        "assembly",
+    ]
 
-    if transcript_frames:
-        transcripts_df = pd.concat(
-            transcript_frames,
-            ignore_index=True,
-        )
-    else:
-        transcripts_df = pd.DataFrame(
-            columns=TRANSCRIPT_COLUMNS
-        )
+    transcript_columns = [
+        "gene_symbol",
+        "gene_id",
+        "transcript_id",
+        "transcript_name",
+        "biotype",
+        "is_canonical",
+        "chromosome",
+        "genomic_start",
+        "genomic_end",
+        "strand",
+        "assembly",
+        "sequence_status",
+        "sequence_length",
+    ]
+
+    error_columns = [
+        "gene_symbol",
+        "error",
+    ]
 
     return {
-        "genes": genes_df,
-        "transcripts": transcripts_df,
-        "fasta": "\n".join(fasta_records),
-        "errors": pd.DataFrame(errors),
-        "source": "Ensembl REST API",
-        "species": "Homo sapiens",
+        "genes": pd.DataFrame(
+            genes,
+            columns=gene_columns,
+        ),
+        "transcripts": pd.DataFrame(
+            transcripts,
+            columns=transcript_columns,
+        ),
+        "errors": pd.DataFrame(
+            errors,
+            columns=error_columns,
+        ),
+        "fasta": "".join(fasta_parts),
     }
