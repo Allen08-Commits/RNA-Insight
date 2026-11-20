@@ -10,11 +10,15 @@ import pandas as pd
 import requests
 
 
-ENSEMBL_BASE = "https://rest.ensembl.org"
+ENSEMBL_BASES = [
+    "https://rest.ensembl.org",
+    "https://useast.rest.ensembl.org",
+    "https://asia.rest.ensembl.org",
+]
 HEADERS = {
     "Content-Type": "application/json",
     "Accept": "application/json",
-    "User-Agent": "RNA-Insight/1.0",
+    "User-Agent": "RNA-Insight/1.1 (academic bioinformatics research; contact: project team)",
 }
 
 REQUIRED_TRANSCRIPT_COLUMNS = {
@@ -30,45 +34,63 @@ class MappingError(Exception):
 def _get_transcript_annotation(
     transcript_id: str,
     timeout: int = 30,
-    retries: int = 3,
+    retries: int = 2,
 ) -> dict[str, Any]:
-    """Retrieve an expanded Ensembl transcript annotation."""
-
-    url = f"{ENSEMBL_BASE}/lookup/id/{transcript_id}"
-
+    """Retrieve expanded transcript annotation using Ensembl mirror failover."""
     last_error = None
+    forbidden_hosts = []
 
-    for attempt in range(retries):
-
-        try:
-            response = requests.get(
-                url,
-                headers=HEADERS,
-                params={"expand": 1},
-                timeout=timeout,
-            )
-
-            if response.status_code == 429 or response.status_code >= 500:
-                time.sleep(1.5 * (attempt + 1))
-                continue
-
-            response.raise_for_status()
-
-            data = response.json()
-
-            if not isinstance(data, dict):
-                raise MappingError(
-                    f"Unexpected Ensembl response for {transcript_id}"
+    for base_url in ENSEMBL_BASES:
+        url = f"{base_url}/lookup/id/{transcript_id}"
+        for attempt in range(retries):
+            try:
+                response = requests.get(
+                    url,
+                    headers=HEADERS,
+                    params={"expand": 1},
+                    timeout=timeout,
                 )
+                if response.status_code == 403:
+                    forbidden_hosts.append(base_url)
+                    last_error = f"HTTP 403 Forbidden from {base_url}"
+                    break
+                if response.status_code == 429:
+                    wait = response.headers.get("Retry-After", "3")
+                    try:
+                        wait_seconds = min(max(float(wait), 1.0), 30.0)
+                    except (TypeError, ValueError):
+                        wait_seconds = 3.0
+                    last_error = f"HTTP 429 rate limit from {base_url}"
+                    if attempt < retries - 1:
+                        time.sleep(wait_seconds)
+                        continue
+                    break
+                if response.status_code >= 500:
+                    last_error = f"HTTP {response.status_code} from {base_url}"
+                    if attempt < retries - 1:
+                        time.sleep(1.5 * (attempt + 1))
+                        continue
+                    break
+                response.raise_for_status()
+                data = response.json()
+                if not isinstance(data, dict):
+                    raise MappingError(
+                        f"Unexpected Ensembl response for {transcript_id}"
+                    )
+                return data
+            except requests.RequestException as exc:
+                last_error = f"{base_url}: {exc}"
+                if attempt < retries - 1:
+                    time.sleep(1.0 * (attempt + 1))
 
-            return data
-
-        except requests.RequestException as exc:
-            last_error = exc
-            time.sleep(1.5 * (attempt + 1))
-
+    if forbidden_hosts:
+        raise MappingError(
+            f"Ensembl returned HTTP 403 for {transcript_id} on: "
+            + ", ".join(forbidden_hosts)
+            + ". The hosting IP may be temporarily restricted."
+        )
     raise MappingError(
-        f"Could not retrieve {transcript_id}: {last_error}"
+        f"Could not retrieve {transcript_id} from Ensembl mirrors: {last_error}"
     )
 
 
