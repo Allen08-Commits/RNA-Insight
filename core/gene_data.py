@@ -9,28 +9,12 @@ from __future__ import annotations
 
 import json
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from typing import Any
 
 import pandas as pd
+import requests
 
-
-BASE_URL = "https://rest.ensembl.org"
-SPECIES = "homo_sapiens"
-
-DEFAULT_GENES = [
-    "HSPA1A",
-    "HSP90AA1",
-    "DDIT3",
-    "ATF4",
-]
-
-HEADERS = {
-    "Accept": "application/json",
-    "User-Agent": "RNA-Insight/1.0 (research application)",
-}
 
 GENE_COLUMNS = [
     "gene_symbol",
@@ -72,58 +56,57 @@ class EnsemblError(Exception):
 
 
 def _get_json(endpoint: str) -> Any:
-    """Request JSON from Ensembl with retries for temporary failures."""
-
-    url = BASE_URL + endpoint
-
-    request = urllib.request.Request(
-        url,
-        headers=HEADERS,
-        method="GET",
-    )
-
+    """Fetch JSON, failing over across Ensembl REST mirrors on HTTP errors."""
     last_error = None
+    forbidden_hosts = []
 
-    for attempt in range(3):
-        try:
-            with urllib.request.urlopen(
-                request,
-                timeout=40,
-            ) as response:
-                content = response.read().decode("utf-8")
-
-            return json.loads(content)
-
-        except urllib.error.HTTPError as exc:
-            last_error = exc
-
-            if exc.code in (429, 500, 502, 503, 504):
-                time.sleep(2 ** attempt)
-                continue
-
-            detail = ""
-
+    for base_url in ENSEMBL_BASES:
+        url = base_url + endpoint
+        for attempt in range(2):
             try:
-                detail = exc.read().decode("utf-8")[:500]
-            except Exception:
-                pass
+                response = requests.get(url, headers=HEADERS, timeout=35)
+                if response.status_code == 403:
+                    forbidden_hosts.append(base_url)
+                    last_error = f"HTTP 403 Forbidden from {base_url}"
+                    break  # do not repeatedly hit a host that has refused access
+                if response.status_code == 429:
+                    wait = response.headers.get("Retry-After", "3")
+                    try:
+                        wait_seconds = min(max(float(wait), 1.0), 30.0)
+                    except (TypeError, ValueError):
+                        wait_seconds = 3.0
+                    last_error = f"HTTP 429 rate limit from {base_url}"
+                    if attempt == 0:
+                        time.sleep(wait_seconds)
+                        continue
+                    break
+                if response.status_code >= 500:
+                    last_error = f"HTTP {response.status_code} from {base_url}"
+                    if attempt == 0:
+                        time.sleep(1.5)
+                        continue
+                    break
+                response.raise_for_status()
+                try:
+                    return response.json()
+                except ValueError as exc:
+                    last_error = f"Invalid JSON from {base_url}: {exc}"
+                    break
+            except requests.RequestException as exc:
+                last_error = f"{base_url}: {exc}"
+                if attempt == 0:
+                    time.sleep(1.0)
+                    continue
+                break
 
-            raise EnsemblError(
-                f"Ensembl HTTP {exc.code}: "
-                f"{detail or exc.reason}"
-            ) from exc
-
-        except (
-            urllib.error.URLError,
-            TimeoutError,
-            json.JSONDecodeError,
-        ) as exc:
-            last_error = exc
-            time.sleep(2 ** attempt)
-
-    raise EnsemblError(
-        f"Unable to contact Ensembl after 3 attempts: {last_error}"
-    )
+    if forbidden_hosts:
+        raise EnsemblError(
+            "Ensembl refused requests (HTTP 403) on: "
+            + ", ".join(forbidden_hosts)
+            + ". The hosting IP may be temporarily restricted by Ensembl. "
+            + "Wait before retrying or use the manual Ensembl export workflow."
+        )
+    raise EnsemblError(f"All Ensembl REST mirrors failed. Last error: {last_error}")
 
 
 def _lookup_gene(symbol: str) -> dict:
@@ -150,7 +133,10 @@ def _lookup_gene(symbol: str) -> dict:
         ):
             return result
 
-    except EnsemblError:
+    except EnsemblError as exc:
+        if "HTTP 403" in str(exc) or "All Ensembl REST mirrors failed" in str(exc):
+            raise
+        # Continue to the cross-reference lookup for genuine lookup failures.
         pass
 
     # Fallback: search external cross-references.
